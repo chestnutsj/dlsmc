@@ -1,0 +1,6 @@
+/build/
+/build-*/
+*.profraw
+*.profdata
+/coverage/
+compile_commands.json
