@@ -1,0 +1,38 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    { "name": "debug", "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "asan", "binaryDir": "${sourceDir}/build/asan",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "DLSM_SANITIZER": "address" } },
+    { "name": "ubsan", "binaryDir": "${sourceDir}/build/ubsan",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "DLSM_SANITIZER": "undefined" } },
+    { "name": "tsan", "binaryDir": "${sourceDir}/build/tsan",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "DLSM_SANITIZER": "thread" } },
+    { "name": "coverage", "binaryDir": "${sourceDir}/build/coverage",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "DLSM_COVERAGE": "ON",
+        "CMAKE_C_COMPILER": "clang" } },
+    { "name": "release", "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    { "name": "benchmark", "binaryDir": "${sourceDir}/build/benchmark",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",
+        "DLSM_BUILD_BENCHMARKS": "ON" } }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "coverage", "configurePreset": "coverage" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "benchmark", "configurePreset": "benchmark" }
+  ],
+  "testPresets": [
+    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
+    { "name": "ubsan", "configurePreset": "ubsan", "output": { "outputOnFailure": true } },
+    { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } }
+  ]
+}

@@ -1,0 +1,8 @@
+option(DLSM_COVERAGE "Enable clang source-based coverage" OFF)
+function(dlsm_apply_coverage target)
+  if(NOT DLSM_COVERAGE)
+    return()
+  endif()
+  target_compile_options(${target} PRIVATE -fprofile-instr-generate -fcoverage-mapping -O0 -g)
+  target_link_options(${target} PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+endfunction()

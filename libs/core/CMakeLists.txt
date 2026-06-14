@@ -1,0 +1,10 @@
+add_library(dlsm_core src/core.c)
+target_include_directories(dlsm_core PUBLIC include)
+dlsm_apply_sanitizer(dlsm_core)
+dlsm_apply_coverage(dlsm_core)
+
+add_executable(test_core tests/test_core.c)
+target_link_libraries(test_core PRIVATE dlsm_core unity)
+dlsm_apply_sanitizer(test_core)
+dlsm_apply_coverage(test_core)
+add_test(NAME core_unit COMMAND ${DLSM_TEST_LAUNCHER} $<TARGET_FILE:test_core>)

@@ -4,3 +4,7 @@
 *.profdata
 /coverage/
 compile_commands.json
+docs
+.codex
+.claude
+
