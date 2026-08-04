@@ -1,4 +1,8 @@
-add_library(dlsm_greenthread src/greenthread.c src/context_x86_64.S)
+add_library(dlsm_greenthread
+  src/greenthread.c
+  src/vp_idle_pthread.c
+  src/context_x86_64.S
+)
 target_include_directories(dlsm_greenthread PUBLIC include)
 target_link_libraries(dlsm_greenthread PUBLIC dlsm_core dlsm_sync)
 target_link_libraries(dlsm_greenthread PRIVATE pthread)

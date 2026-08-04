@@ -60,7 +60,7 @@ static void test_consolidate(void) {
     TEST_ASSERT_GREATER_THAN_UINT64(0, st.consolidations); /* chain collapsed at least once */
     TEST_ASSERT_EQUAL_UINT64(19, st.live_keys);            /* 20 inserted, 1 deleted */
 
-    uint64_t off;
+    uint64_t off = 0;
     for (int i = 0; i < 20; i++) {
         snprintf(k, sizeof k, "k%02d", i);
         if (i == 7) { TEST_ASSERT_EQUAL_INT(DLSM_INDEX_E_NOTFOUND, get_off(t, k, &off)); continue; }

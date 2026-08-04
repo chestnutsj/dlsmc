@@ -98,11 +98,11 @@ static void test_concurrent_recovery_has_one_writer(void) {
             close(release_pipe[1]);
             dlsm_shm *s = NULL;
             dlsm_status result = dlsm_shm_create_or_recover(NAME, SIZE, &s);
-            (void)write(report_pipe[1], &result, sizeof(result));
+            ssize_t reported = write(report_pipe[1], &result, sizeof(result));
             char release;
-            (void)read(release_pipe[0], &release, 1);
+            ssize_t released = read(release_pipe[0], &release, 1);
             if (s) { dlsm_shm_detach(s); }
-            _exit(0);
+            _exit(reported == (ssize_t)sizeof(result) && released == 1 ? 0 : 3);
         }
     }
     close(report_pipe[1]);

@@ -1,14 +1,17 @@
 #define _GNU_SOURCE
 #include "dlsm/greenthread.h"
 #include "dlsm/sync.h"
+#include "vp_idle.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <time.h>
 
 /* ---- ThreadSanitizer fiber annotations -------------------------------------
  * Without these, TSAN cannot follow stack switches and reports false races.
@@ -48,6 +51,10 @@ enum transition { TR_YIELD, TR_PARK, TR_FINISH };
 enum runtime_state { RT_CREATED, RT_RUNNING, RT_STOPPING, RT_STOPPED };
 
 #define DLSM_GT_MIN_STACK (16u * 1024u)
+#define DLSM_GT_VPS_PER_CHUNK 64
+/* Local work normally wins for cache locality, but a finite burst prevents
+ * two yielding local GTs from starving tasks submitted to the group queue. */
+#define DLSM_GT_LOCAL_BURST 64u
 
 struct dlsm_gt_task {
     void   *rsp;                 /* saved stack pointer when suspended */
@@ -62,8 +69,8 @@ struct dlsm_gt_task {
     int     unpark_pending;
     int     priority;
     int     group_id;
-    int     worker_id;
-    int     last_worker_id;
+    int     vp_id;
+    int     last_vp_id;
     uint32_t flags;
     int     saved_errno;
     struct dlsm_gt_task *next;   /* run-queue link */
@@ -74,50 +81,114 @@ struct task_queue {
     dlsm_ticket_lock lock;
     dlsm_gt_task *head;
     dlsm_gt_task *tail;
+    uint64_t size;
 };
 
-struct worker_group {
+struct vp_group {
     struct task_queue ready[DLSM_GT_PRIORITY_LEVELS];
-    int nworkers;
+    int nvp;
 };
 
-struct worker {
+struct vp {
     pthread_t thread;
     dlsm_gt_runtime *rt;
     dlsm_gt_task *current;
-    void *sched_rsp;             /* worker's own stack pointer while in a task */
-    void *sched_fiber;           /* TSAN fiber of the worker's OS thread */
+    dlsm_gt_task *last_yielded;
+    void *sched_rsp;             /* VP's own stack pointer while in a task */
+    void *sched_fiber;           /* TSAN fiber of the VP's pthread */
     int transition;
     int saved_errno;
     int id;
     int group_id;
     struct task_queue local[DLSM_GT_PRIORITY_LEVELS];
     struct task_queue bound[DLSM_GT_PRIORITY_LEVELS];
+    uint32_t local_burst[DLSM_GT_PRIORITY_LEVELS];
+    dlsm_gt_vp_idle idle;
+    dlsm_gt_vp_stats stats;
+};
+
+struct vp_chunk {
+    struct vp entries[DLSM_GT_VPS_PER_CHUNK];
+    struct vp_chunk *next;
 };
 
 struct dlsm_gt_runtime {
     dlsm_ticket_lock lock;
-    dlsm_event       work;       /* a task became runnable */
-    dlsm_event       done;       /* live reached 0 or the runtime failed */
     dlsm_gt_task   *all_tasks;
     int    live;                 /* spawned-but-not-finished tasks */
     int    shutdown;
     int    state;
     dlsm_status fatal;
-    int    nworkers;
-    int    started_workers;
+    int    nvp;
+    int    started_vps;
+    int    ngroups;
     size_t stack_bytes;
-    struct worker *workers;
-    struct worker_group *groups;
+    uint32_t idle_spin_count;
+    struct vp_chunk *vp_chunks;
+    struct vp_group *groups;
     dlsm_gt_stats stats;
 };
 
-static __thread struct worker *tls_worker;
+static __thread struct vp *tls_vp;
 
 #define STAT_INC(rt, field) \
     ((void)__atomic_add_fetch(&(rt)->stats.field, 1, __ATOMIC_RELAXED))
 #define STAT_DEC(rt, field) \
     ((void)__atomic_sub_fetch(&(rt)->stats.field, 1, __ATOMIC_RELAXED))
+#define VP_STAT_INC(vp, field) \
+    ((void)__atomic_add_fetch(&(vp)->stats.field, 1, __ATOMIC_RELAXED))
+
+static struct vp *vp_at(dlsm_gt_runtime *rt, int vp_id) {
+    struct vp_chunk *chunk = rt->vp_chunks;
+    int index = vp_id;
+    while (chunk && index >= DLSM_GT_VPS_PER_CHUNK) {
+        chunk = __atomic_load_n(&chunk->next, __ATOMIC_ACQUIRE);
+        index -= DLSM_GT_VPS_PER_CHUNK;
+    }
+    return chunk ? &chunk->entries[index] : NULL;
+}
+
+static int ensure_vp_slot(dlsm_gt_runtime *rt, int vp_id) {
+    int chunk_index = vp_id / DLSM_GT_VPS_PER_CHUNK;
+    struct vp_chunk **link = &rt->vp_chunks;
+    for (int i = 0; i <= chunk_index; i++) {
+        struct vp_chunk *chunk = __atomic_load_n(link, __ATOMIC_ACQUIRE);
+        if (!chunk) {
+            chunk = calloc(1, sizeof(*chunk));
+            if (!chunk) { return -1; }
+            __atomic_store_n(link, chunk, __ATOMIC_RELEASE);
+        }
+        link = &chunk->next;
+    }
+    return 0;
+}
+
+static int vp_init(dlsm_gt_runtime *rt, int vp_id, int group_id) {
+    if (ensure_vp_slot(rt, vp_id) != 0) { return -1; }
+    struct vp *vp = vp_at(rt, vp_id);
+    vp->rt = rt;
+    vp->id = vp_id;
+    vp->group_id = group_id;
+    for (int priority = 0; priority < DLSM_GT_PRIORITY_LEVELS; priority++) {
+        dlsm_ticket_init(&vp->local[priority].lock);
+        dlsm_ticket_init(&vp->bound[priority].lock);
+    }
+    return dlsm_gt_vp_idle_init(&vp->idle, rt->idle_spin_count);
+}
+
+static void vp_chunks_free(struct vp_chunk *chunk) {
+    while (chunk) {
+        struct vp_chunk *next = chunk->next;
+        free(chunk);
+        chunk = next;
+    }
+}
+
+static uint64_t clock_ns(clockid_t clock_id) {
+    struct timespec ts;
+    if (clock_gettime(clock_id, &ts) != 0) { return 0; }
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
 
 /* ---- strerror ------------------------------------------------------------- */
 const char *dlsm_gt_strerror(dlsm_status st) {
@@ -178,8 +249,8 @@ static dlsm_gt_task *task_new(dlsm_gt_runtime *rt, void (*entry)(void *), void *
     t->state = ST_NEW;
     t->priority = options->priority;
     t->group_id = options->group_id;
-    t->worker_id = options->worker_id;
-    t->last_worker_id = -1;
+    t->vp_id = options->vp_id;
+    t->last_vp_id = -1;
     t->flags = options->flags;
     if (make_stack(t, rt->stack_bytes) != 0) { free(t); return NULL; }
     t->fiber = TSAN_CREATE();
@@ -206,6 +277,7 @@ static void queue_push(struct task_queue *q, dlsm_gt_task *t) {
     dlsm_ticket_lock_acquire(&q->lock);
     if (q->tail) { q->tail->next = t; } else { q->head = t; }
     q->tail = t;
+    q->size++;
     dlsm_ticket_lock_release(&q->lock);
 }
 
@@ -216,6 +288,39 @@ static dlsm_gt_task *queue_pop(struct task_queue *q) {
         q->head = t->next;
         if (!q->head) { q->tail = NULL; }
         t->next = NULL;
+        q->size--;
+    }
+    dlsm_ticket_lock_release(&q->lock);
+    return t;
+}
+
+/* A yielding GT stays local for CPU locality, but must not immediately run
+ * again while another GT of the same priority is ready elsewhere. */
+static dlsm_gt_task *queue_pop_unless(struct task_queue *q,
+                                      dlsm_gt_task *avoid) {
+    dlsm_ticket_lock_acquire(&q->lock);
+    dlsm_gt_task *t = q->head;
+    if (t == avoid) { t = NULL; }
+    if (t) {
+        q->head = t->next;
+        if (!q->head) { q->tail = NULL; }
+        t->next = NULL;
+        q->size--;
+    }
+    dlsm_ticket_lock_release(&q->lock);
+    return t;
+}
+
+/* Stealing is a locality fallback. Leave the victim's last runnable GT in
+ * place so a single yielding GT cannot bounce continuously between VPs. */
+static dlsm_gt_task *queue_steal_surplus(struct task_queue *q) {
+    dlsm_ticket_lock_acquire(&q->lock);
+    dlsm_gt_task *t = NULL;
+    if (q->size > 1) {
+        t = q->head;
+        q->head = t->next;
+        t->next = NULL;
+        q->size--;
     }
     dlsm_ticket_lock_release(&q->lock);
     return t;
@@ -228,18 +333,38 @@ static void task_make_ready(dlsm_gt_runtime *rt, dlsm_gt_task *t,
     queue_push(q, t);
 }
 
-static dlsm_gt_task *worker_try_next(struct worker *w) {
-    dlsm_gt_runtime *rt = w->rt;
+static dlsm_gt_task *vp_try_next(struct vp *vp) {
+    dlsm_gt_runtime *rt = vp->rt;
     dlsm_gt_task *t = NULL;
+    dlsm_gt_task *avoid = vp->last_yielded;
+    vp->last_yielded = NULL;
     int stolen = 0;
     for (int priority = 0; priority < DLSM_GT_PRIORITY_LEVELS && !t; priority++) {
-        t = queue_pop(&w->bound[priority]);
-        if (!t) { t = queue_pop(&rt->groups[w->group_id].ready[priority]); }
-        if (!t) { t = queue_pop(&w->local[priority]); }
-        for (int offset = 1; offset < rt->nworkers && !t; offset++) {
-            struct worker *victim = &rt->workers[(w->id + offset) % rt->nworkers];
-            if (victim->group_id == w->group_id) {
-                t = queue_pop(&victim->local[priority]);
+        t = queue_pop_unless(&vp->bound[priority], avoid);
+        if (!t && vp->local_burst[priority] < DLSM_GT_LOCAL_BURST) {
+            t = queue_pop_unless(&vp->local[priority], avoid);
+            if (t) { vp->local_burst[priority]++; }
+        }
+        if (!t) {
+            t = queue_pop(&rt->groups[vp->group_id].ready[priority]);
+            if (t) { vp->local_burst[priority] = 0; }
+        }
+        if (!t) {
+            t = queue_pop_unless(&vp->local[priority], avoid);
+            if (t) { vp->local_burst[priority] = 1; }
+        }
+        /* No peer at this priority was ready, so resuming the yielding GT is
+         * preferable to considering any lower-priority work. */
+        if (!t) { t = queue_pop(&vp->bound[priority]); }
+        if (!t) {
+            t = queue_pop(&vp->local[priority]);
+            if (t) { vp->local_burst[priority] = 1; }
+        }
+        int nvp = __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE);
+        for (int offset = 1; offset < nvp && !t; offset++) {
+            struct vp *victim = vp_at(rt, (vp->id + offset) % nvp);
+            if (victim->group_id == vp->group_id) {
+                t = queue_steal_surplus(&victim->local[priority]);
                 if (t) { stolen = 1; }
             }
         }
@@ -247,14 +372,53 @@ static dlsm_gt_task *worker_try_next(struct worker *w) {
     if (t) {
         dlsm_ticket_lock_acquire(&t->lock);
         t->state = ST_RUNNING;
-        t->last_worker_id = w->id;
+        if (t->last_vp_id >= 0 && t->last_vp_id != vp->id) {
+            STAT_INC(rt, migrations);
+            VP_STAT_INC(vp, migrations);
+        }
+        t->last_vp_id = vp->id;
         dlsm_ticket_lock_release(&t->lock);
         STAT_DEC(rt, ready);
         STAT_INC(rt, running);
         STAT_INC(rt, context_switches);
-        if (stolen) { STAT_INC(rt, steals); }
+        VP_STAT_INC(vp, dispatches);
+        if (stolen) {
+            STAT_INC(rt, steals);
+            VP_STAT_INC(vp, steals);
+        }
     }
     return t;
+}
+
+static void vp_mark_running(struct vp *vp) {
+    atomic_store_explicit(&vp->idle.state, DLSM_GT_VP_RUNNING,
+                          memory_order_release);
+}
+
+static int wake_group_vp(dlsm_gt_runtime *rt, int group_id, int exclude_id) {
+    /* Match belib's preference: a busy-spinning VP can accept the wake in
+     * userspace, avoiding pthread_cond_signal and its possible OS transition. */
+    for (int desired = DLSM_GT_VP_SPINNING;
+         desired <= DLSM_GT_VP_SLEEPING; desired++) {
+        int nvp = __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < nvp; i++) {
+            struct vp *candidate = vp_at(rt, i);
+            if (i == exclude_id || candidate->group_id != group_id) { continue; }
+            if (atomic_load_explicit(&candidate->idle.state,
+                                     memory_order_acquire) == desired &&
+                dlsm_gt_vp_idle_wake(&candidate->idle)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void wake_all_vps(dlsm_gt_runtime *rt) {
+    int nvp = __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nvp; i++) {
+        dlsm_gt_vp_idle_wake(&vp_at(rt, i)->idle);
+    }
 }
 
 static int runtime_is_shutdown(dlsm_gt_runtime *rt) {
@@ -265,64 +429,64 @@ static int runtime_is_shutdown(dlsm_gt_runtime *rt) {
     return shutdown;
 }
 
-static dlsm_gt_task *sched_next(struct worker *w) {
-    dlsm_gt_runtime *rt = w->rt;
+static dlsm_gt_task *sched_next(struct vp *vp) {
+    dlsm_gt_runtime *rt = vp->rt;
     for (;;) {
-        dlsm_gt_task *t = worker_try_next(w);
-        if (t) { return t; }
+        dlsm_gt_task *t = vp_try_next(vp);
+        if (t) { vp_mark_running(vp); return t; }
         if (runtime_is_shutdown(rt)) { return NULL; }
-        uint32_t observed = dlsm_event_snapshot(&rt->work);
-        t = worker_try_next(w); /* close the scan/snapshot lost-wakeup window */
-        if (t) { return t; }
-        if (runtime_is_shutdown(rt)) { return NULL; }
-        STAT_INC(rt, sleeping_workers);
-        STAT_INC(rt, worker_waits);
-        dlsm_status st = dlsm_event_wait(&rt->work, observed);
-        STAT_DEC(rt, sleeping_workers);
-        STAT_INC(rt, worker_wakes);
-        if (st != DLSM_OK) {
+
+        dlsm_gt_vp_idle_spin(&vp->idle);
+        t = vp_try_next(vp); /* recheck after publishing SPINNING */
+        if (t) { vp_mark_running(vp); return t; }
+        if (runtime_is_shutdown(rt)) { vp_mark_running(vp); return NULL; }
+
+        STAT_INC(rt, sleeping_vps);
+        int slept = dlsm_gt_vp_idle_sleep(&vp->idle);
+        STAT_DEC(rt, sleeping_vps);
+        if (slept < 0) {
             dlsm_ticket_lock_acquire(&rt->lock);
             rt->fatal = DLSM_GT_E_WAIT;
             rt->shutdown = 1;
             rt->state = RT_STOPPING;
             dlsm_ticket_lock_release(&rt->lock);
-            dlsm_event_notify_all(&rt->work);
-            dlsm_event_notify_all(&rt->done);
+            wake_all_vps(rt);
             return NULL;
+        }
+        if (slept) {
+            STAT_INC(rt, vp_waits);
+            STAT_INC(rt, vp_wakes);
         }
     }
 }
 
-static void rt_enqueue(struct worker *w, dlsm_gt_task *t) {
-    dlsm_gt_runtime *rt = w->rt;
+static void rt_enqueue(struct vp *vp, dlsm_gt_task *t) {
+    dlsm_gt_runtime *rt = vp->rt;
     STAT_DEC(rt, running);
     STAT_INC(rt, yields);
     dlsm_ticket_lock_acquire(&t->lock);
-    task_make_ready(rt, t, t->worker_id == DLSM_GT_WORKER_ANY
-                           ? &w->local[t->priority]
-                           : &rt->workers[t->worker_id].bound[t->priority]);
+    vp->last_yielded = t;
+    task_make_ready(rt, t, t->vp_id == DLSM_GT_VP_ANY
+                           ? &vp->local[t->priority]
+                           : &vp_at(rt, t->vp_id)->bound[t->priority]);
     dlsm_ticket_lock_release(&t->lock);
-    dlsm_event_notify_one(&rt->work);
 }
 
-static void rt_park(struct worker *w, dlsm_gt_task *t) {
-    dlsm_gt_runtime *rt = w->rt;
-    int runnable = 0;
+static void rt_park(struct vp *vp, dlsm_gt_task *t) {
+    dlsm_gt_runtime *rt = vp->rt;
     STAT_DEC(rt, running);
     STAT_INC(rt, parks);
     dlsm_ticket_lock_acquire(&t->lock);
     if (t->unpark_pending) {            /* unpark raced ahead of the park */
         t->unpark_pending = 0;
-        task_make_ready(rt, t, t->worker_id == DLSM_GT_WORKER_ANY
-                               ? &w->local[t->priority]
-                               : &rt->workers[t->worker_id].bound[t->priority]);
-        runnable = 1;
+        task_make_ready(rt, t, t->vp_id == DLSM_GT_VP_ANY
+                               ? &vp->local[t->priority]
+                               : &vp_at(rt, t->vp_id)->bound[t->priority]);
     } else {
         t->state = ST_PARKED;
         STAT_INC(rt, parked);
     }
     dlsm_ticket_lock_release(&t->lock);
-    if (runnable) { dlsm_event_notify_one(&rt->work); }
 }
 
 static void rt_task_done(dlsm_gt_runtime *rt, dlsm_gt_task *t) {
@@ -340,91 +504,159 @@ static void rt_task_done(dlsm_gt_runtime *rt, dlsm_gt_task *t) {
     }
     dlsm_ticket_lock_release(&rt->lock);
     if (completed) {
-        dlsm_event_notify_all(&rt->work);
-        dlsm_event_notify_all(&rt->done);
+        wake_all_vps(rt);
     }
 }
 
-/* ---- worker loop ---------------------------------------------------------- */
-static void *worker_main(void *arg) {
-    struct worker *w = (struct worker *)arg;
-    tls_worker = w;
-    w->sched_fiber = TSAN_CUR();
+/* ---- VP loop -------------------------------------------------------------- */
+static void *vp_main(void *arg) {
+    struct vp *vp = (struct vp *)arg;
+    uint64_t wall_start = clock_ns(CLOCK_MONOTONIC);
+    uint64_t cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    tls_vp = vp;
+    vp->sched_fiber = TSAN_CUR();
     for (;;) {
-        dlsm_gt_task *t = sched_next(w);
+        dlsm_gt_task *t = sched_next(vp);
         if (!t) { break; }
-        w->current = t;
-        w->saved_errno = errno;
+        vp->current = t;
+        vp->saved_errno = errno;
         errno = t->saved_errno;
         TSAN_SWITCH(t->fiber);
-        dlsm_gt_ctx_switch(&w->sched_rsp, t->rsp);
-        /* back on the worker's own stack/fiber (the task switched us here) */
+        dlsm_gt_ctx_switch(&vp->sched_rsp, t->rsp);
+        /* back on the VP's own stack/fiber (the task switched us here) */
         t->saved_errno = errno;
-        errno = w->saved_errno;
-        w->current = NULL;
-        switch (w->transition) {
-        case TR_YIELD:  rt_enqueue(w, t); break;
-        case TR_PARK:   rt_park(w, t);    break;
-        case TR_FINISH: rt_task_done(w->rt, t); task_release_stack(t); break;
+        errno = vp->saved_errno;
+        vp->current = NULL;
+        switch (vp->transition) {
+        case TR_YIELD:  rt_enqueue(vp, t); break;
+        case TR_PARK:   rt_park(vp, t);    break;
+        case TR_FINISH: rt_task_done(vp->rt, t); task_release_stack(t); break;
         }
+    }
+    uint64_t cpu_end = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    uint64_t wall_end = clock_ns(CLOCK_MONOTONIC);
+    if (cpu_end >= cpu_start) {
+        __atomic_store_n(&vp->stats.thread_cpu_ns, cpu_end - cpu_start,
+                         __ATOMIC_RELAXED);
+    }
+    if (wall_end >= wall_start) {
+        __atomic_store_n(&vp->stats.wall_ns, wall_end - wall_start,
+                         __ATOMIC_RELAXED);
     }
     return NULL;
 }
 
 /* ---- public API ----------------------------------------------------------- */
-dlsm_gt_runtime *dlsm_gt_runtime_new(int nworkers, size_t stack_bytes) {
+dlsm_gt_runtime *dlsm_gt_runtime_new(int nvp, size_t stack_bytes) {
     dlsm_gt_runtime_options options = {
-        .nworkers = nworkers, .stack_bytes = stack_bytes, .worker_groups = NULL
+        .nvp = nvp, .stack_bytes = stack_bytes, .vp_groups = NULL,
+        .idle_spin_count = 0
     };
     return dlsm_gt_runtime_new_ex(&options);
 }
 
 dlsm_gt_runtime *dlsm_gt_runtime_new_ex(const dlsm_gt_runtime_options *options) {
     if (!options) { return NULL; }
-    int nworkers = options->nworkers;
+    int nvp = options->nvp;
     size_t stack_bytes = options->stack_bytes;
-    if (options->worker_groups && nworkers <= 0) { return NULL; }
-    if (nworkers <= 0) {
+    /* Public option value 0 means "use the documented default", not "off".
+     * This keeps zero-initialized option structs useful. Disabling the spin
+     * phase requires the explicit DLSM_GT_IDLE_SPINS_DISABLED sentinel. */
+    uint32_t idle_spin_count = options->idle_spin_count == 0
+        ? DLSM_GT_IDLE_SPINS_DEFAULT
+        : options->idle_spin_count;
+    if (idle_spin_count == DLSM_GT_IDLE_SPINS_DISABLED) {
+        idle_spin_count = 0;
+    }
+    if (options->vp_groups && nvp <= 0) { return NULL; }
+    if (nvp <= 0) {
         long n = sysconf(_SC_NPROCESSORS_ONLN);
-        nworkers = (n > 0) ? (int)n : 1;
+        nvp = (n > 0) ? (int)n : 1;
     }
     if (stack_bytes == 0) { stack_bytes = 128 * 1024; }
     if (stack_bytes < DLSM_GT_MIN_STACK) { return NULL; }
 
     dlsm_gt_runtime *rt = calloc(1, sizeof(*rt));
     if (!rt) { return NULL; }
-    rt->workers = calloc((size_t)nworkers, sizeof(struct worker));
-    if (!rt->workers) { free(rt); return NULL; }
-    rt->groups = calloc((size_t)nworkers, sizeof(struct worker_group));
-    if (!rt->groups) { free(rt->workers); free(rt); return NULL; }
+    rt->groups = calloc((size_t)nvp, sizeof(struct vp_group));
+    if (!rt->groups) { free(rt); return NULL; }
     dlsm_ticket_init(&rt->lock);
-    dlsm_event_init(&rt->work);
-    dlsm_event_init(&rt->done);
     rt->state = RT_CREATED;
     rt->fatal = DLSM_OK;
-    rt->nworkers = nworkers;
+    rt->ngroups = nvp;
     rt->stack_bytes = stack_bytes;
-    for (int group = 0; group < nworkers; group++) {
+    rt->idle_spin_count = idle_spin_count;
+    for (int group = 0; group < nvp; group++) {
         for (int priority = 0; priority < DLSM_GT_PRIORITY_LEVELS; priority++) {
             dlsm_ticket_init(&rt->groups[group].ready[priority].lock);
         }
     }
-    for (int i = 0; i < nworkers; i++) {
-        int group = options->worker_groups ? options->worker_groups[i]
+    int initialized_vps = 0;
+    for (int i = 0; i < nvp; i++) {
+        int group = options->vp_groups ? options->vp_groups[i]
                                            : DLSM_GT_GROUP_DEFAULT;
-        if (group < 0 || group >= nworkers) {
-            free(rt->groups); free(rt->workers); free(rt); return NULL;
+        if (group < 0 || group >= nvp) {
+            for (int j = 0; j < initialized_vps; j++) {
+                dlsm_gt_vp_idle_destroy(&vp_at(rt, j)->idle);
+            }
+            free(rt->groups); vp_chunks_free(rt->vp_chunks); free(rt); return NULL;
         }
-        rt->workers[i].rt = rt;
-        rt->workers[i].id = i;
-        rt->workers[i].group_id = group;
-        rt->groups[group].nworkers++;
-        for (int priority = 0; priority < DLSM_GT_PRIORITY_LEVELS; priority++) {
-            dlsm_ticket_init(&rt->workers[i].local[priority].lock);
-            dlsm_ticket_init(&rt->workers[i].bound[priority].lock);
+        if (vp_init(rt, i, group) != 0) {
+            for (int j = 0; j < initialized_vps; j++) {
+                dlsm_gt_vp_idle_destroy(&vp_at(rt, j)->idle);
+            }
+            free(rt->groups); vp_chunks_free(rt->vp_chunks); free(rt); return NULL;
         }
+        __atomic_add_fetch(&rt->groups[group].nvp, 1, __ATOMIC_RELAXED);
+        initialized_vps++;
     }
+    __atomic_store_n(&rt->nvp, nvp, __ATOMIC_RELEASE);
     return rt;
+}
+
+dlsm_status dlsm_gt_runtime_add_vp(dlsm_gt_runtime *rt, int group_id,
+                                   int *new_vp_id) {
+    if (!rt || !new_vp_id) { return DLSM_GT_E_INVAL; }
+    dlsm_ticket_lock_acquire(&rt->lock);
+    if (rt->state != RT_CREATED && rt->state != RT_RUNNING) {
+        dlsm_ticket_lock_release(&rt->lock);
+        return DLSM_GT_E_STATE;
+    }
+    if (group_id < 0 || group_id >= rt->ngroups ||
+        __atomic_load_n(&rt->groups[group_id].nvp, __ATOMIC_ACQUIRE) == 0) {
+        dlsm_ticket_lock_release(&rt->lock);
+        return DLSM_GT_E_INVAL;
+    }
+    int vp_id = __atomic_load_n(&rt->nvp, __ATOMIC_RELAXED);
+    if (vp_id == INT_MAX) {
+        dlsm_ticket_lock_release(&rt->lock);
+        return DLSM_GT_E_NOMEM;
+    }
+    if (vp_init(rt, vp_id, group_id) != 0) {
+        dlsm_ticket_lock_release(&rt->lock);
+        return DLSM_GT_E_NOMEM;
+    }
+    struct vp *vp = vp_at(rt, vp_id);
+    if (rt->state == RT_RUNNING &&
+        pthread_create(&vp->thread, NULL, vp_main, vp) != 0) {
+        dlsm_gt_vp_idle_destroy(&vp->idle);
+        memset(vp, 0, sizeof(*vp));
+        dlsm_ticket_lock_release(&rt->lock);
+        return DLSM_GT_E_THREAD;
+    }
+    __atomic_add_fetch(&rt->groups[group_id].nvp, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&rt->nvp, vp_id + 1, __ATOMIC_RELEASE);
+    if (rt->state == RT_RUNNING) {
+        __atomic_add_fetch(&rt->started_vps, 1, __ATOMIC_RELEASE);
+        dlsm_gt_vp_idle_wake(&vp->idle);
+    }
+    *new_vp_id = vp_id;
+    dlsm_ticket_lock_release(&rt->lock);
+    return DLSM_OK;
+}
+
+int dlsm_gt_runtime_vp_count(dlsm_gt_runtime *rt) {
+    return rt ? __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE) : 0;
 }
 
 dlsm_status dlsm_gt_runtime_free(dlsm_gt_runtime *rt) {
@@ -442,8 +674,12 @@ dlsm_status dlsm_gt_runtime_free(dlsm_gt_runtime *rt) {
         task_free(tasks);
         tasks = next;
     }
+    int nvp = __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nvp; i++) {
+        dlsm_gt_vp_idle_destroy(&vp_at(rt, i)->idle);
+    }
     free(rt->groups);
-    free(rt->workers);
+    vp_chunks_free(rt->vp_chunks);
     free(rt);
     return DLSM_OK;
 }
@@ -452,7 +688,7 @@ dlsm_gt_task *dlsm_gt_spawn(dlsm_gt_runtime *rt, void (*entry)(void *), void *ar
     dlsm_gt_task_options options = {
         .priority = DLSM_GT_PRIORITY_DEFAULT,
         .group_id = DLSM_GT_GROUP_INHERIT,
-        .worker_id = DLSM_GT_WORKER_ANY,
+        .vp_id = DLSM_GT_VP_ANY,
         .flags = 0
     };
     return dlsm_gt_spawn_ex(rt, entry, arg, &options);
@@ -464,20 +700,22 @@ dlsm_gt_task *dlsm_gt_spawn_ex(dlsm_gt_runtime *rt, void (*entry)(void *),
     dlsm_gt_task_options resolved = options ? *options : (dlsm_gt_task_options){
         .priority = DLSM_GT_PRIORITY_DEFAULT,
         .group_id = DLSM_GT_GROUP_INHERIT,
-        .worker_id = DLSM_GT_WORKER_ANY,
+        .vp_id = DLSM_GT_VP_ANY,
         .flags = 0
     };
-    struct worker *caller = tls_worker;
+    struct vp *caller = tls_vp;
     if (resolved.group_id == DLSM_GT_GROUP_INHERIT) {
         resolved.group_id = caller && caller->rt == rt ? caller->group_id
-                                                       : rt->workers[0].group_id;
+                                                       : vp_at(rt, 0)->group_id;
     }
     if (resolved.priority < 0 || resolved.priority >= DLSM_GT_PRIORITY_LEVELS ||
-        resolved.group_id < 0 || resolved.group_id >= rt->nworkers ||
-        rt->groups[resolved.group_id].nworkers == 0 || resolved.flags != 0 ||
-        resolved.worker_id < DLSM_GT_WORKER_ANY || resolved.worker_id >= rt->nworkers ||
-        (resolved.worker_id != DLSM_GT_WORKER_ANY &&
-         rt->workers[resolved.worker_id].group_id != resolved.group_id)) {
+        resolved.group_id < 0 || resolved.group_id >= rt->ngroups ||
+        __atomic_load_n(&rt->groups[resolved.group_id].nvp,
+                        __ATOMIC_ACQUIRE) == 0 || resolved.flags != 0 ||
+        resolved.vp_id < DLSM_GT_VP_ANY ||
+        resolved.vp_id >= __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE) ||
+        (resolved.vp_id != DLSM_GT_VP_ANY &&
+         vp_at(rt, resolved.vp_id)->group_id != resolved.group_id)) {
         return NULL;
     }
     dlsm_gt_task *t = task_new(rt, entry, arg, &resolved);
@@ -493,16 +731,27 @@ dlsm_gt_task *dlsm_gt_spawn_ex(dlsm_gt_runtime *rt, void (*entry)(void *),
     rt->live++;
     dlsm_ticket_lock_release(&rt->lock);
     STAT_INC(rt, spawned);
+    int wake_vp_id = DLSM_GT_VP_ANY;
+    int wake_group_id = -1;
+    int exclude_vp_id = DLSM_GT_VP_ANY;
     dlsm_ticket_lock_acquire(&t->lock);
-    if (t->worker_id != DLSM_GT_WORKER_ANY) {
-        task_make_ready(rt, t, &rt->workers[t->worker_id].bound[t->priority]);
+    if (t->vp_id != DLSM_GT_VP_ANY) {
+        task_make_ready(rt, t, &vp_at(rt, t->vp_id)->bound[t->priority]);
+        wake_vp_id = t->vp_id;
     } else if (caller && caller->rt == rt && caller->group_id == t->group_id) {
         task_make_ready(rt, t, &caller->local[t->priority]);
+        wake_group_id = t->group_id;
+        exclude_vp_id = caller->id;
     } else {
         task_make_ready(rt, t, &rt->groups[t->group_id].ready[t->priority]);
+        wake_group_id = t->group_id;
     }
     dlsm_ticket_lock_release(&t->lock);
-    dlsm_event_notify_one(&rt->work);
+    if (wake_vp_id != DLSM_GT_VP_ANY) {
+        dlsm_gt_vp_idle_wake(&vp_at(rt, wake_vp_id)->idle);
+    } else {
+        wake_group_vp(rt, wake_group_id, exclude_vp_id);
+    }
     return t;
 }
 
@@ -513,43 +762,41 @@ dlsm_status dlsm_gt_run(dlsm_gt_runtime *rt) {
         dlsm_ticket_lock_release(&rt->lock);
         return DLSM_GT_E_STATE;
     }
+    if (rt->live == 0) {
+        rt->state = RT_STOPPED;
+        dlsm_ticket_lock_release(&rt->lock);
+        return DLSM_OK;
+    }
     rt->state = RT_RUNNING;
-    dlsm_ticket_lock_release(&rt->lock);
-
-    for (int i = 0; i < rt->nworkers; i++) {
-        if (pthread_create(&rt->workers[i].thread, NULL, worker_main,
-                           &rt->workers[i]) != 0) {
-            dlsm_ticket_lock_acquire(&rt->lock);
+    int initial_nvp = __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE);
+    int start_failed = 0;
+    for (int i = 0; i < initial_nvp; i++) {
+        struct vp *vp = vp_at(rt, i);
+        if (pthread_create(&vp->thread, NULL, vp_main, vp) != 0) {
             rt->fatal = DLSM_GT_E_THREAD;
             rt->shutdown = 1;
             rt->state = RT_STOPPING;
-            dlsm_ticket_lock_release(&rt->lock);
-            dlsm_event_notify_all(&rt->work);
-            dlsm_event_notify_all(&rt->done);
+            start_failed = 1;
             break;
         }
-        rt->started_workers++;
+        __atomic_add_fetch(&rt->started_vps, 1, __ATOMIC_RELEASE);
     }
+    dlsm_ticket_lock_release(&rt->lock);
+    if (start_failed) { wake_all_vps(rt); }
 
     dlsm_ticket_lock_acquire(&rt->lock);
-    while (rt->live > 0 && rt->fatal == DLSM_OK) {
-        uint32_t observed = dlsm_event_snapshot(&rt->done);
-        dlsm_ticket_lock_release(&rt->lock);
-        dlsm_status st = dlsm_event_wait(&rt->done, observed);
-        dlsm_ticket_lock_acquire(&rt->lock);
-        if (st != DLSM_OK) { rt->fatal = DLSM_GT_E_WAIT; }
-    }
-    rt->shutdown = 1;
-    rt->state = RT_STOPPING;
     dlsm_status result = rt->fatal;
     dlsm_ticket_lock_release(&rt->lock);
-    dlsm_event_notify_all(&rt->work);
-    for (int i = 0; i < rt->started_workers; i++) {
-        if (pthread_join(rt->workers[i].thread, NULL) != 0 && result == DLSM_OK) {
+    for (int i = 0;
+         i < __atomic_load_n(&rt->started_vps, __ATOMIC_ACQUIRE); i++) {
+        if (pthread_join(vp_at(rt, i)->thread, NULL) != 0 && result == DLSM_OK) {
             result = DLSM_GT_E_THREAD;
         }
     }
     dlsm_ticket_lock_acquire(&rt->lock);
+    if (result == DLSM_OK && rt->fatal != DLSM_OK) {
+        result = rt->fatal;
+    }
     rt->state = RT_STOPPED;
     rt->fatal = result;
     dlsm_ticket_lock_release(&rt->lock);
@@ -557,40 +804,42 @@ dlsm_status dlsm_gt_run(dlsm_gt_runtime *rt) {
 }
 
 void dlsm_gt_yield(void) {
-    struct worker *w = tls_worker;
-    if (!w || !w->current) { return; }
-    dlsm_gt_task *t = w->current;
-    w->transition = TR_YIELD;
-    TSAN_SWITCH(w->sched_fiber);
-    dlsm_gt_ctx_switch(&t->rsp, w->sched_rsp);
+    struct vp *vp = tls_vp;
+    if (!vp || !vp->current) { return; }
+    dlsm_gt_task *t = vp->current;
+    vp->transition = TR_YIELD;
+    TSAN_SWITCH(vp->sched_fiber);
+    dlsm_gt_ctx_switch(&t->rsp, vp->sched_rsp);
 }
 
 void dlsm_gt_park(void) {
-    struct worker *w = tls_worker;
-    if (!w || !w->current) { return; }
-    dlsm_gt_task *t = w->current;
-    w->transition = TR_PARK;
-    TSAN_SWITCH(w->sched_fiber);
-    dlsm_gt_ctx_switch(&t->rsp, w->sched_rsp);
+    struct vp *vp = tls_vp;
+    if (!vp || !vp->current) { return; }
+    dlsm_gt_task *t = vp->current;
+    vp->transition = TR_PARK;
+    TSAN_SWITCH(vp->sched_fiber);
+    dlsm_gt_ctx_switch(&t->rsp, vp->sched_rsp);
 }
 
 dlsm_gt_task *dlsm_gt_self(void) {
-    struct worker *w = tls_worker;
-    return w ? w->current : NULL;
+    struct vp *vp = tls_vp;
+    return vp ? vp->current : NULL;
 }
 
-int dlsm_gt_worker_id(void) {
-    return tls_worker ? tls_worker->id : DLSM_GT_WORKER_ANY;
+int dlsm_gt_vp_id(void) {
+    return tls_vp ? tls_vp->id : DLSM_GT_VP_ANY;
 }
 
 int dlsm_gt_group_id(void) {
-    return tls_worker ? tls_worker->group_id : DLSM_GT_GROUP_INHERIT;
+    return tls_vp ? tls_vp->group_id : DLSM_GT_GROUP_INHERIT;
 }
 
 dlsm_status dlsm_gt_unpark(dlsm_gt_task *t) {
     if (!t) { return DLSM_GT_E_INVAL; }
     dlsm_gt_runtime *rt = t->rt;
     int runnable = 0;
+    int wake_vp_id = DLSM_GT_VP_ANY;
+    int wake_group_id = -1;
     dlsm_ticket_lock_acquire(&rt->lock);
     int stopped = rt->state == RT_STOPPED;
     dlsm_ticket_lock_release(&rt->lock);
@@ -603,12 +852,18 @@ dlsm_status dlsm_gt_unpark(dlsm_gt_task *t) {
     if (t->state == ST_PARKED) {
         STAT_DEC(rt, parked);
         struct task_queue *q;
-        if (t->worker_id != DLSM_GT_WORKER_ANY) {
-            q = &rt->workers[t->worker_id].bound[t->priority];
-        } else if (t->last_worker_id >= 0) {
-            q = &rt->workers[t->last_worker_id].local[t->priority];
+        if (t->vp_id != DLSM_GT_VP_ANY) {
+            q = &vp_at(rt, t->vp_id)->bound[t->priority];
+            wake_vp_id = t->vp_id;
+        } else if (t->last_vp_id >= 0) {
+            q = &vp_at(rt, t->last_vp_id)->local[t->priority];
+            /* A singleton local queue is intentionally not stealable. Wake
+             * its owning VP exactly; waking an arbitrary group peer could
+             * leave the owner asleep and lose scheduler progress. */
+            wake_vp_id = t->last_vp_id;
         } else {
             q = &rt->groups[t->group_id].ready[t->priority];
+            wake_group_id = t->group_id;
         }
         task_make_ready(rt, t, q);
         runnable = 1;
@@ -616,7 +871,11 @@ dlsm_status dlsm_gt_unpark(dlsm_gt_task *t) {
         t->unpark_pending = 1;  /* park hasn't completed yet; remember it */
     }
     dlsm_ticket_lock_release(&t->lock);
-    if (runnable) { dlsm_event_notify_one(&rt->work); }
+    if (runnable && wake_vp_id != DLSM_GT_VP_ANY) {
+        dlsm_gt_vp_idle_wake(&vp_at(rt, wake_vp_id)->idle);
+    } else if (runnable) {
+        wake_group_vp(rt, wake_group_id, DLSM_GT_VP_ANY);
+    }
     return DLSM_OK;
 }
 
@@ -632,13 +891,46 @@ dlsm_status dlsm_gt_runtime_stats(dlsm_gt_runtime *rt, dlsm_gt_stats *out) {
         .yields = STAT_LOAD(rt, yields),
         .parks = STAT_LOAD(rt, parks),
         .unparks = STAT_LOAD(rt, unparks),
-        .worker_waits = STAT_LOAD(rt, worker_waits),
-        .worker_wakes = STAT_LOAD(rt, worker_wakes),
+        .vp_waits = STAT_LOAD(rt, vp_waits),
+        .vp_wakes = STAT_LOAD(rt, vp_wakes),
         .steals = STAT_LOAD(rt, steals),
+        .migrations = STAT_LOAD(rt, migrations),
         .ready = STAT_LOAD(rt, ready),
         .running = STAT_LOAD(rt, running),
         .parked = STAT_LOAD(rt, parked),
-        .sleeping_workers = STAT_LOAD(rt, sleeping_workers)
+        .sleeping_vps = STAT_LOAD(rt, sleeping_vps)
+    };
+    return DLSM_OK;
+}
+
+dlsm_status dlsm_gt_runtime_vp_stats(dlsm_gt_runtime *rt, int vp_id,
+                                     dlsm_gt_vp_stats *out) {
+    if (!rt || !out || vp_id < 0 ||
+        vp_id >= __atomic_load_n(&rt->nvp, __ATOMIC_ACQUIRE)) {
+        return DLSM_GT_E_INVAL;
+    }
+    struct vp *vp = vp_at(rt, vp_id);
+    *out = (dlsm_gt_vp_stats) {
+        .dispatches = __atomic_load_n(&vp->stats.dispatches, __ATOMIC_RELAXED),
+        .steals = __atomic_load_n(&vp->stats.steals, __ATOMIC_RELAXED),
+        .migrations = __atomic_load_n(&vp->stats.migrations, __ATOMIC_RELAXED),
+        .idle_entries = atomic_load_explicit(&vp->idle.idle_entries,
+                                             memory_order_relaxed),
+        .spin_iterations = atomic_load_explicit(&vp->idle.spin_iterations,
+                                                memory_order_relaxed),
+        .spin_wakeups = atomic_load_explicit(&vp->idle.spin_wakeups,
+                                             memory_order_relaxed),
+        .sleep_count = atomic_load_explicit(&vp->idle.sleep_count,
+                                            memory_order_relaxed),
+        .os_wakeups = atomic_load_explicit(&vp->idle.os_wakeups,
+                                           memory_order_relaxed),
+        .spinning_ns = atomic_load_explicit(&vp->idle.spinning_ns,
+                                            memory_order_relaxed),
+        .sleeping_ns = atomic_load_explicit(&vp->idle.sleeping_ns,
+                                            memory_order_relaxed),
+        .thread_cpu_ns = __atomic_load_n(&vp->stats.thread_cpu_ns,
+                                         __ATOMIC_RELAXED),
+        .wall_ns = __atomic_load_n(&vp->stats.wall_ns, __ATOMIC_RELAXED)
     };
     return DLSM_OK;
 }
@@ -649,10 +941,10 @@ dlsm_status dlsm_gt_runtime_stats(dlsm_gt_runtime *rt, dlsm_gt_stats *out) {
  * to the scheduler and never returns. */
 __attribute__((used, noreturn))
 void dlsm_gt_task_finish(void) {
-    struct worker *w = tls_worker;
-    dlsm_gt_task *t = w->current;
-    w->transition = TR_FINISH;
-    TSAN_SWITCH(w->sched_fiber);
-    dlsm_gt_ctx_switch(&t->rsp, w->sched_rsp);
+    struct vp *vp = tls_vp;
+    dlsm_gt_task *t = vp->current;
+    vp->transition = TR_FINISH;
+    TSAN_SWITCH(vp->sched_fiber);
+    dlsm_gt_ctx_switch(&t->rsp, vp->sched_rsp);
     __builtin_unreachable();
 }

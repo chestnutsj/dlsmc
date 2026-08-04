@@ -216,7 +216,7 @@ struct PThreadPool {
     bool stop;
 };
 
-void *pthread_pool_worker(void *opaque) {
+void *pthread_pool_thread(void *opaque) {
     auto *pool = static_cast<PThreadPool *>(opaque);
     for (;;) {
         pthread_mutex_lock(&pool->mutex);
@@ -243,21 +243,21 @@ void *pthread_pool_worker(void *opaque) {
     }
 }
 
-bool pthread_pool_init(PThreadPool *pool, int workers,
+bool pthread_pool_init(PThreadPool *pool, int thread_count,
                        std::vector<ComputeArgs> *tasks) {
     pthread_mutex_init(&pool->mutex, nullptr);
     pthread_cond_init(&pool->work_available, nullptr);
     pthread_cond_init(&pool->all_done, nullptr);
     pool->threads.clear();
-    pool->threads.reserve(static_cast<std::size_t>(workers));
+    pool->threads.reserve(static_cast<std::size_t>(thread_count));
     pool->tasks = tasks;
     pool->next_task = 0;
     pool->completed = 0;
     pool->batch_ready = false;
     pool->stop = false;
-    for (int i = 0; i < workers; ++i) {
+    for (int i = 0; i < thread_count; ++i) {
         pthread_t thread;
-        if (pthread_create(&thread, nullptr, pthread_pool_worker, pool) != 0) {
+        if (pthread_create(&thread, nullptr, pthread_pool_thread, pool) != 0) {
             pthread_mutex_lock(&pool->mutex);
             pool->stop = true;
             pthread_cond_broadcast(&pool->work_available);
@@ -300,14 +300,20 @@ void pthread_pool_destroy(PThreadPool *pool) {
     pthread_mutex_destroy(&pool->mutex);
 }
 
-void BM_WorkerScaling(benchmark::State &state) {
-    const int workers = static_cast<int>(state.range(0));
-    constexpr int tasks_per_worker = 32;
+void BM_VPScaling(benchmark::State &state) {
+    const int vp_count = static_cast<int>(state.range(0));
+    constexpr int tasks_per_vp = 32;
     constexpr std::uint64_t iterations_per_task = 65536;
-    std::vector<ComputeArgs> args(static_cast<std::size_t>(workers * tasks_per_worker));
+    std::vector<ComputeArgs> args(static_cast<std::size_t>(vp_count * tasks_per_vp));
+    std::uint64_t total_cpu_ns = 0;
+    std::uint64_t total_wall_ns = 0;
+    std::uint64_t total_sleeps = 0;
+    std::uint64_t total_os_wakeups = 0;
+    std::uint64_t total_spin_wakeups = 0;
+    std::uint64_t total_migrations = 0;
     for (auto _ : state) {
         (void)_;
-        dlsm_gt_runtime *rt = dlsm_gt_runtime_new(workers, 0);
+        dlsm_gt_runtime *rt = dlsm_gt_runtime_new(vp_count, 0);
         for (std::size_t i = 0; i < args.size(); ++i) {
             args[i] = {i + 1, iterations_per_task, 0};
             dlsm_gt_spawn(rt, compute_task, &args[i]);
@@ -315,24 +321,43 @@ void BM_WorkerScaling(benchmark::State &state) {
         dlsm_status status = dlsm_gt_run(rt);
         benchmark::DoNotOptimize(status);
         for (auto &arg : args) { benchmark::DoNotOptimize(arg.result); }
+        for (int vp = 0; vp < vp_count; ++vp) {
+            dlsm_gt_vp_stats stats;
+            if (dlsm_gt_runtime_vp_stats(rt, vp, &stats) == DLSM_OK) {
+                total_cpu_ns += stats.thread_cpu_ns;
+                total_wall_ns += stats.wall_ns;
+                total_sleeps += stats.sleep_count;
+                total_os_wakeups += stats.os_wakeups;
+                total_spin_wakeups += stats.spin_wakeups;
+                total_migrations += stats.migrations;
+            }
+        }
         dlsm_gt_runtime_free(rt);
     }
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(args.size()));
+    const double measured_iterations = static_cast<double>(state.iterations());
+    state.counters["cpu_util_%"] = total_wall_ns == 0 ? 0.0
+        : 100.0 * static_cast<double>(total_cpu_ns) /
+              static_cast<double>(total_wall_ns);
+    state.counters["os_wakeups/iter"] = total_os_wakeups / measured_iterations;
+    state.counters["sleeps/iter"] = total_sleeps / measured_iterations;
+    state.counters["spin_wakeups/iter"] = total_spin_wakeups / measured_iterations;
+    state.counters["migrations/iter"] = total_migrations / measured_iterations;
 }
 
-void BM_PThreadPoolWorkerScaling(benchmark::State &state) {
-    const int workers = static_cast<int>(state.range(0));
-    constexpr int tasks_per_worker = 32;
+void BM_PThreadPoolScaling(benchmark::State &state) {
+    const int thread_count = static_cast<int>(state.range(0));
+    constexpr int tasks_per_thread = 32;
     constexpr std::uint64_t iterations_per_task = 65536;
-    std::vector<ComputeArgs> args(static_cast<std::size_t>(workers * tasks_per_worker));
+    std::vector<ComputeArgs> args(static_cast<std::size_t>(thread_count * tasks_per_thread));
     for (auto _ : state) {
         (void)_;
         for (std::size_t i = 0; i < args.size(); ++i) {
             args[i] = {i + 1, iterations_per_task, 0};
         }
         PThreadPool pool{};
-        if (!pthread_pool_init(&pool, workers, &args)) {
-            state.SkipWithError("pthread pool worker creation failed");
+        if (!pthread_pool_init(&pool, thread_count, &args)) {
+            state.SkipWithError("pthread pool thread creation failed");
             break;
         }
         pthread_pool_run(&pool);
@@ -354,10 +379,10 @@ BENCHMARK(BM_SpawnAndFinish)
 BENCHMARK(BM_PThreadCreateJoin)
     ->Name("PThread/CreateJoin")->Arg(64)->Arg(256)->Arg(1024)->UseRealTime();
 
-BENCHMARK(BM_WorkerScaling)
-    ->Name("GT/WorkerScaling")->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime();
-BENCHMARK(BM_PThreadPoolWorkerScaling)
-    ->Name("PThreadPool/WorkerScaling")->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime();
+BENCHMARK(BM_VPScaling)
+    ->Name("GT/VPScaling")->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime();
+BENCHMARK(BM_PThreadPoolScaling)
+    ->Name("PThreadPool/ThreadScaling")->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime();
 
 } // namespace
 

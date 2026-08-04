@@ -54,24 +54,6 @@ void dlsm_mcs_lock_acquire(dlsm_mcs_lock *l, dlsm_mcs_node *node);
 void dlsm_mcs_lock_release(dlsm_mcs_lock *l, dlsm_mcs_node *node);
 
 /* ---------------------------------------------------------------------------
- * Event — a Linux futex-backed sequence counter for OS-worker sleep/wakeup.
- * A waiter snapshots the sequence while holding the lock that protects its
- * predicate, releases that lock, then waits for the sequence to change. This
- * closes the notify-before-wait race without coupling the event to one lock.
- * Wait may return after a signal, interruption, or spurious wakeup; callers
- * must always re-check their predicate.
- * ------------------------------------------------------------------------- */
-typedef struct {
-    _Atomic uint32_t sequence;
-} dlsm_event;
-
-void        dlsm_event_init(dlsm_event *e);
-uint32_t    dlsm_event_snapshot(const dlsm_event *e);
-dlsm_status dlsm_event_wait(dlsm_event *e, uint32_t observed);
-void        dlsm_event_notify_one(dlsm_event *e);
-void        dlsm_event_notify_all(dlsm_event *e);
-
-/* ---------------------------------------------------------------------------
  * Epoch-Based Reclamation (EBR) — 3-generation. Retired objects are freed
  * only after every active reader has left the epoch in which they could have
  * observed the object (testing.md §4 I3: never free a reachable object).

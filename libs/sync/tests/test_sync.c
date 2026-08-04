@@ -117,20 +117,10 @@ static void test_gt_mutex_uncontended(void) {
     }
 }
 
-static void test_event_remembers_early_notification(void) {
-    dlsm_event e;
-    dlsm_event_init(&e);
-    uint32_t before = dlsm_event_snapshot(&e);
-    dlsm_event_notify_one(&e);
-    TEST_ASSERT_NOT_EQUAL(before, dlsm_event_snapshot(&e));
-    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_event_wait(&e, before));
-}
-
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_strerror_table);
     RUN_TEST(test_gt_mutex_uncontended);
-    RUN_TEST(test_event_remembers_early_notification);
     RUN_TEST(test_ticket_single_thread);
     RUN_TEST(test_mcs_single_thread);
     RUN_TEST(test_ebr_register_full);

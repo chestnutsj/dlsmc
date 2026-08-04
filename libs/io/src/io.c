@@ -46,6 +46,7 @@ static int iou_enter(int fd, unsigned to_submit, unsigned min_complete, unsigned
 
 struct slot {
     _Atomic int   res;
+    _Atomic int   wake_done;
     dlsm_gt_task *task;
     int           next; /* free-list link, -1 = none */
 };
@@ -141,6 +142,10 @@ static void *reaper_main(void *arg) {
             TSAN_ACQUIRE(s); /* pairs with the submitter's release (io_uring edge) */
             atomic_store_explicit(&s->res, res, memory_order_release);
             dlsm_gt_unpark(s->task);
+            /* The resumed GT may be the runtime's final task. Do not let it
+             * return from do_op and free the runtime while this reaper still
+             * has an unpark call using the task/VP objects on its stack. */
+            atomic_store_explicit(&s->wake_done, 1, memory_order_release);
         }
         atomic_store_explicit((_Atomic unsigned *)io->c_head, head, memory_order_release);
         if (atomic_load_explicit(&io->stop, memory_order_acquire)) { break; }
@@ -155,9 +160,14 @@ static ssize_t do_op(dlsm_io *io, uint8_t op, int fd, uint64_t addr, unsigned le
     int tok;
     while ((tok = slot_alloc(io)) < 0) { dlsm_gt_yield(); } /* cooperative backpressure */
     io->slots[tok].task = dlsm_gt_self();
+    atomic_store_explicit(&io->slots[tok].wake_done, 0, memory_order_relaxed);
     TSAN_RELEASE(&io->slots[tok]); /* publish slot.task before the kernel sees the SQE */
     submit(io, op, fd, addr, len, off, fsync_flags, (uint64_t)tok);
     dlsm_gt_park();
+    while (!atomic_load_explicit(&io->slots[tok].wake_done,
+                                 memory_order_acquire)) {
+        dlsm_gt_yield();
+    }
     int res = atomic_load_explicit(&io->slots[tok].res, memory_order_acquire);
     slot_free(io, tok);
     if (res < 0) { errno = -res; return -1; }
