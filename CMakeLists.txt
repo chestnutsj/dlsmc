@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(dlsm C ASM)
+project(dlsm VERSION 0.1.0 LANGUAGES C ASM)
 
 option(DLSM_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 option(DLSM_BUILD_IO "Build the io_uring library, tests, and examples" ON)
@@ -20,6 +20,10 @@ add_compile_options(-Wall -Wextra -Werror)
 include(cmake/CPM.cmake)
 include(cmake/sanitizers.cmake)
 include(cmake/coverage.cmake)
+include(cmake/gt_source_checks.cmake)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+find_package(Threads REQUIRED)
 
 CPMAddPackage(
   NAME unity
@@ -79,8 +83,96 @@ add_subdirectory(libs/core)
 add_subdirectory(libs/shm)
 add_subdirectory(libs/sync)
 add_subdirectory(libs/greenthread)
+
+# Public convenience target for embedders. This is intentionally INTERFACE:
+# it creates no third library and follows the static/shared choice of the two
+# implementation targets selected by BUILD_SHARED_LIBS.
+add_library(dlsm_gt INTERFACE)
+add_library(dlsm::gt ALIAS dlsm_gt)
+set_target_properties(dlsm_gt PROPERTIES EXPORT_NAME gt)
+target_link_libraries(dlsm_gt INTERFACE dlsm_greenthread dlsm_sync)
+
+add_executable(test_gt_adapter libs/greenthread/tests/test_gt_adapter.c)
+target_link_libraries(test_gt_adapter PRIVATE dlsm_gt unity pthread)
+dlsm_apply_sanitizer(test_gt_adapter)
+dlsm_apply_coverage(test_gt_adapter)
+add_test(NAME test_gt_adapter
+  COMMAND ${DLSM_TEST_LAUNCHER} $<TARGET_FILE:test_gt_adapter>)
+
 add_subdirectory(libs/index)
 if(DLSM_IO_URING_AVAILABLE)
   add_subdirectory(libs/io)
   add_subdirectory(examples)
 endif()
+
+# Check the complete embedding project at configure time. The fixture directory
+# intentionally contains rejected examples and is verified by separate tests.
+dlsm_gt_enable_source_checks(
+  EXCLUDE_PATHS cmake/tests/native_tls_fixtures
+                cmake/tests/blocking_call_fixtures
+)
+
+add_test(NAME cmake_gt_native_tls_rejected
+  COMMAND ${CMAKE_COMMAND}
+    -DDLSM_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DDLSM_CHECK_ROOT=${CMAKE_SOURCE_DIR}/cmake/tests/native_tls_fixtures/rejected
+    -P ${CMAKE_SOURCE_DIR}/cmake/tests/run_gt_source_check.cmake)
+set_tests_properties(cmake_gt_native_tls_rejected PROPERTIES WILL_FAIL TRUE)
+
+add_test(NAME cmake_gt_native_tls_allowed
+  COMMAND ${CMAKE_COMMAND}
+    -DDLSM_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DDLSM_CHECK_ROOT=${CMAKE_SOURCE_DIR}/cmake/tests/native_tls_fixtures/allowed
+    -P ${CMAKE_SOURCE_DIR}/cmake/tests/run_gt_source_check.cmake)
+
+add_test(NAME cmake_gt_native_tls_disabled
+  COMMAND ${CMAKE_COMMAND}
+    -DDLSM_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DDLSM_CHECK_ROOT=${CMAKE_SOURCE_DIR}/cmake/tests/native_tls_fixtures/rejected
+    -DDLSM_CHECK_ENABLED=OFF
+    -P ${CMAKE_SOURCE_DIR}/cmake/tests/run_gt_source_check.cmake)
+
+add_test(NAME cmake_gt_blocking_call_warning
+  COMMAND ${CMAKE_COMMAND}
+    -DDLSM_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DDLSM_CHECK_ROOT=${CMAKE_SOURCE_DIR}/cmake/tests/blocking_call_fixtures/warning
+    -DDLSM_CHECK_ENABLED=OFF
+    -DDLSM_BLOCKING_WARNING_ENABLED=ON
+    -P ${CMAKE_SOURCE_DIR}/cmake/tests/run_gt_source_check.cmake)
+set_tests_properties(cmake_gt_blocking_call_warning PROPERTIES
+  PASS_REGULAR_EXPRESSION "Potential blocking calls in GT-enabled source")
+
+add_test(NAME cmake_gt_blocking_call_allowed
+  COMMAND ${CMAKE_COMMAND}
+    -DDLSM_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DDLSM_CHECK_ROOT=${CMAKE_SOURCE_DIR}/cmake/tests/blocking_call_fixtures/allowed
+    -DDLSM_CHECK_ENABLED=OFF
+    -DDLSM_BLOCKING_WARNING_ENABLED=ON
+    -P ${CMAKE_SOURCE_DIR}/cmake/tests/run_gt_source_check.cmake)
+set_tests_properties(cmake_gt_blocking_call_allowed PROPERTIES
+  PASS_REGULAR_EXPRESSION "GT blocking-call source warning passed")
+
+install(TARGETS dlsm_core dlsm_sync dlsm_greenthread dlsm_gt
+  EXPORT dlsmTargets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(DIRECTORY
+  libs/core/include/dlsm
+  libs/sync/include/dlsm
+  libs/greenthread/include/dlsm
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT dlsmTargets FILE dlsmTargets.cmake NAMESPACE dlsm::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dlsm)
+configure_package_config_file(cmake/dlsmConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/dlsmConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dlsm)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/dlsmConfigVersion.cmake
+  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/dlsmConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/dlsmConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dlsm)
+configure_file(cmake/dlsm-greenthread.pc.in dlsm-greenthread.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/dlsm-greenthread.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

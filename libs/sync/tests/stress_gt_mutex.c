@@ -20,7 +20,8 @@ typedef struct {
     int             permit;
 } parker;
 
-static __thread parker *tls_parker;
+/* This fixture models one suspend context per physical pthread. */
+static __thread parker *tls_parker; /* DLSM_GT_NATIVE_TLS_ALLOWED */
 
 static void *sp_current(void) { return tls_parker; }
 static void  sp_park(void) {
@@ -37,7 +38,10 @@ static void sp_unpark(void *h) {
     pthread_cond_signal(&p->cv);
     pthread_mutex_unlock(&p->m);
 }
-static const dlsm_suspend_ops SP_OPS = { sp_current, sp_park, sp_unpark };
+static const dlsm_suspend_ops SP_OPS = {
+    .current = sp_current, .park = sp_park, .unpark = sp_unpark,
+    .park_until = NULL
+};
 
 static dlsm_gt_mutex g_mtx;
 static long          g_counter; /* non-atomic, protected by g_mtx */

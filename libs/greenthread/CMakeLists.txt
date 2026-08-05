@@ -3,9 +3,17 @@ add_library(dlsm_greenthread
   src/vp_idle_pthread.c
   src/context_x86_64.S
 )
-target_include_directories(dlsm_greenthread PUBLIC include)
+target_include_directories(dlsm_greenthread PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+add_library(dlsm::greenthread ALIAS dlsm_greenthread)
+set_target_properties(dlsm_greenthread PROPERTIES
+  EXPORT_NAME greenthread
+  VERSION ${PROJECT_VERSION}
+  SOVERSION 0
+  C_VISIBILITY_PRESET default)
 target_link_libraries(dlsm_greenthread PUBLIC dlsm_core dlsm_sync)
-target_link_libraries(dlsm_greenthread PRIVATE pthread)
+target_link_libraries(dlsm_greenthread PRIVATE Threads::Threads)
 dlsm_apply_sanitizer(dlsm_greenthread)
 dlsm_apply_coverage(dlsm_greenthread)
 
@@ -15,6 +23,24 @@ target_link_libraries(test_gt PRIVATE dlsm_greenthread unity pthread)
 dlsm_apply_sanitizer(test_gt)
 dlsm_apply_coverage(test_gt)
 add_test(NAME test_gt COMMAND ${DLSM_TEST_LAUNCHER} $<TARGET_FILE:test_gt>)
+
+# Compile a private copy of the runtime so deterministic pthread-create fault
+# injection never enters the installed library or its production fast paths.
+add_executable(test_gt_start_failure
+  tests/test_gt_start_failure.c
+  src/greenthread.c
+  src/vp_idle_pthread.c
+  src/context_x86_64.S)
+target_compile_definitions(test_gt_start_failure PRIVATE
+  DLSM_GT_TEST_FAULT_INJECTION=1)
+target_include_directories(test_gt_start_failure PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_gt_start_failure PRIVATE
+  dlsm_core dlsm_sync unity Threads::Threads)
+dlsm_apply_sanitizer(test_gt_start_failure)
+dlsm_apply_coverage(test_gt_start_failure)
+add_test(NAME test_gt_start_failure
+  COMMAND ${DLSM_TEST_LAUNCHER} $<TARGET_FILE:test_gt_start_failure>)
 
 # --- multi-core parallel stress (L3/L4) under TSAN ---
 add_executable(stress_gt_parallel tests/stress_gt_parallel.c)

@@ -147,25 +147,29 @@ static void ebr_key_dtor(void *p) {
     ebr_reg *r = p;
     while (r) { ebr_reg *n = r->next; dlsm_ebr_unregister(r->e, r->slot); free(r); r = n; }
 }
-static void ebr_key_make(void) { pthread_key_create(&g_ebr_key, ebr_key_dtor); }
+static void ebr_key_make(void) { /* DLSM_GT_NATIVE_TLS_ALLOWED */
+    pthread_key_create(&g_ebr_key, ebr_key_dtor); /* DLSM_GT_NATIVE_TLS_ALLOWED */
+}
 static int ebr_slot(dlsm_ebr *e) {
     pthread_once(&g_ebr_once, ebr_key_make);
-    ebr_reg *r = pthread_getspecific(g_ebr_key);
+    ebr_reg *r = pthread_getspecific(g_ebr_key); /* DLSM_GT_NATIVE_TLS_ALLOWED */
     for (ebr_reg *x = r; x; x = x->next) { if (x->e == e) { return x->slot; } }
     int slot;
     if (dlsm_ebr_register(e, &slot) != DLSM_OK) { return -1; }
     ebr_reg *nr = malloc(sizeof *nr);
     if (!nr) { dlsm_ebr_unregister(e, slot); return -1; }
     nr->e = e; nr->slot = slot; nr->next = r;
-    pthread_setspecific(g_ebr_key, nr);
+    pthread_setspecific(g_ebr_key, nr); /* DLSM_GT_NATIVE_TLS_ALLOWED */
     return slot;
 }
 static void ebr_unreg_self(dlsm_ebr *e) {
-    ebr_reg *r = pthread_getspecific(g_ebr_key), *prev = NULL;
+    ebr_reg *r = pthread_getspecific(g_ebr_key), *prev = NULL; /* DLSM_GT_NATIVE_TLS_ALLOWED */
     for (ebr_reg *x = r; x; prev = x, x = x->next) {
         if (x->e == e) {
             dlsm_ebr_unregister(e, x->slot);
-            if (prev) { prev->next = x->next; } else { pthread_setspecific(g_ebr_key, x->next); }
+            if (prev) { prev->next = x->next; } else {
+                pthread_setspecific(g_ebr_key, x->next); /* DLSM_GT_NATIVE_TLS_ALLOWED */
+            }
             free(x);
             return;
         }

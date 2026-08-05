@@ -4,10 +4,6 @@
  *   rdi = save_rsp     (store current rsp here)
  *   rsi = restore_rsp  (load this rsp)
  *
- * Saves the callee-saved registers required by the SysV AMD64 ABI plus the
- * MXCSR and x87 control words (also callee-saved). XMM data registers are
- * caller-saved, so a switch performed at a call boundary need not preserve
- * them. Fast path target: < 50 ns.
  */
     .text
     .globl  dlsm_gt_ctx_switch

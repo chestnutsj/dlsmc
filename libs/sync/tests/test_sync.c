@@ -15,6 +15,8 @@ static void test_strerror_table(void) {
                              dlsm_sync_strerror(DLSM_SYNC_E_WAIT));
     TEST_ASSERT_EQUAL_STRING("out of memory",
                              dlsm_sync_strerror(DLSM_SYNC_E_NOMEM));
+    TEST_ASSERT_EQUAL_STRING("invalid synchronization state",
+                             dlsm_sync_strerror(DLSM_SYNC_E_STATE));
     TEST_ASSERT_EQUAL_STRING("unknown error", dlsm_sync_strerror(123));
 }
 
@@ -105,22 +107,70 @@ static void test_ebr_no_premature_free(void) {
  * contention, so park/unpark must never be called. */
 static void boom_park(void)        { TEST_FAIL_MESSAGE("park called with no contention"); }
 static void boom_unpark(void *h)   { (void)h; TEST_FAIL_MESSAGE("unpark called with no contention"); }
-static void *null_current(void)    { return (void *)0; }
-static const dlsm_suspend_ops BOOM_OPS = { null_current, boom_park, boom_unpark };
+static int g_boom_context;
+static void *boom_current(void)    { return &g_boom_context; }
+static const dlsm_suspend_ops BOOM_OPS = {
+    .current = boom_current, .park = boom_park, .unpark = boom_unpark,
+    .park_until = NULL
+};
 
 static void test_gt_mutex_uncontended(void) {
     dlsm_gt_mutex m;
-    dlsm_gt_mutex_init(&m, &BOOM_OPS);
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_init(&m, &BOOM_OPS));
     for (int i = 0; i < 100; i++) {
-        dlsm_gt_mutex_lock(&m);    /* fast path: no other holder */
-        dlsm_gt_mutex_unlock(&m);  /* empty queue: just clears the flag */
+        TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_lock(&m));
+        TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_unlock(&m));
     }
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_destroy(&m));
+}
+
+static void test_gt_mutex_trylock_and_state_checks(void) {
+    dlsm_gt_mutex m;
+    int acquired = 0;
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_init(&m, &BOOM_OPS));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_trylock(&m, &acquired));
+    TEST_ASSERT_EQUAL_INT(1, acquired);
+    TEST_ASSERT_EQUAL_INT(DLSM_SYNC_E_STATE, dlsm_gt_mutex_lock(&m));
+    TEST_ASSERT_EQUAL_INT(DLSM_SYNC_E_STATE, dlsm_gt_mutex_destroy(&m));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_unlock(&m));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_mutex_destroy(&m));
+}
+
+static void test_gt_wait_group_count_and_state_checks(void) {
+    dlsm_gt_wait_group group;
+    TEST_ASSERT_EQUAL_INT(DLSM_OK,
+        dlsm_gt_wait_group_init(&group, &BOOM_OPS, 0));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_wait_group_wait(&group));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_wait_group_add(&group, 2));
+    TEST_ASSERT_EQUAL_INT(DLSM_SYNC_E_STATE,
+                          dlsm_gt_wait_group_destroy(&group));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_wait_group_done(&group));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_wait_group_done(&group));
+    TEST_ASSERT_EQUAL_INT(DLSM_SYNC_E_STATE,
+                          dlsm_gt_wait_group_done(&group));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_wait_group_destroy(&group));
+}
+
+static void test_gt_completion_is_one_shot(void) {
+    dlsm_gt_completion completion;
+    TEST_ASSERT_EQUAL_INT(DLSM_OK,
+        dlsm_gt_completion_init(&completion, &BOOM_OPS));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK,
+                          dlsm_gt_completion_complete(&completion));
+    TEST_ASSERT_EQUAL_INT(DLSM_SYNC_E_STATE,
+                          dlsm_gt_completion_complete(&completion));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK, dlsm_gt_completion_wait(&completion));
+    TEST_ASSERT_EQUAL_INT(DLSM_OK,
+                          dlsm_gt_completion_destroy(&completion));
 }
 
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_strerror_table);
     RUN_TEST(test_gt_mutex_uncontended);
+    RUN_TEST(test_gt_mutex_trylock_and_state_checks);
+    RUN_TEST(test_gt_wait_group_count_and_state_checks);
+    RUN_TEST(test_gt_completion_is_one_shot);
     RUN_TEST(test_ticket_single_thread);
     RUN_TEST(test_mcs_single_thread);
     RUN_TEST(test_ebr_register_full);

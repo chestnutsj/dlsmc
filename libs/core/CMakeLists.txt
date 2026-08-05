@@ -1,5 +1,13 @@
 add_library(dlsm_core src/core.c)
-target_include_directories(dlsm_core PUBLIC include)
+target_include_directories(dlsm_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+add_library(dlsm::core ALIAS dlsm_core)
+set_target_properties(dlsm_core PROPERTIES
+  EXPORT_NAME core
+  VERSION ${PROJECT_VERSION}
+  SOVERSION 0
+  C_VISIBILITY_PRESET default)
 dlsm_apply_sanitizer(dlsm_core)
 dlsm_apply_coverage(dlsm_core)
 

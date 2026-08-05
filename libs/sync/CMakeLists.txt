@@ -1,5 +1,14 @@
-add_library(dlsm_sync src/ticket.c src/mcs.c src/ebr.c src/gt_mutex.c src/strerror.c)
-target_include_directories(dlsm_sync PUBLIC include)
+add_library(dlsm_sync src/ticket.c src/mcs.c src/ebr.c src/gt_mutex.c
+  src/gt_wait.c src/strerror.c)
+target_include_directories(dlsm_sync PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+add_library(dlsm::sync ALIAS dlsm_sync)
+set_target_properties(dlsm_sync PROPERTIES
+  EXPORT_NAME sync
+  VERSION ${PROJECT_VERSION}
+  SOVERSION 0
+  C_VISIBILITY_PRESET default)
 target_link_libraries(dlsm_sync PUBLIC dlsm_core)
 dlsm_apply_sanitizer(dlsm_sync)
 dlsm_apply_coverage(dlsm_sync)

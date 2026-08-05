@@ -13,7 +13,10 @@
     X(DLSM_SYNC_E_TOO_MANY_THREADS, 30001, "too many EBR threads")    \
     X(DLSM_SYNC_E_INVAL,            30002, DLSM_MSG_INVAL)             \
     X(DLSM_SYNC_E_WAIT,             30003, "wait operation failed")   \
-    X(DLSM_SYNC_E_NOMEM,            30004, "out of memory")
+    X(DLSM_SYNC_E_NOMEM,            30004, "out of memory")          \
+    X(DLSM_SYNC_E_STATE,            30005, "invalid synchronization state") \
+    X(DLSM_SYNC_E_TIMEOUT,          30006, "wait deadline expired")  \
+    X(DLSM_SYNC_E_CANCELLED,        30007, "wait operation cancelled")
 
 enum {
 #define DLSM_SYNC_ENUM_X(name, code, msg) name = code,
@@ -89,23 +92,124 @@ typedef struct {
  * ahead of the matching park must still resume the context), and unpark must
  * establish happens-before into the resumed park. dlsm-greenthread's
  * park/unpark satisfy this.
+ *
+ * First-stage scope: the mutex is non-recursive, process-private and not
+ * robust. It has no owner-death recovery and must not be placed in shared
+ * memory for use by another process.
  * ------------------------------------------------------------------------- */
-typedef struct {
+typedef struct dlsm_suspend_ops {
     void *(*current)(void);        /* opaque handle of the calling context */
     void  (*park)(void);           /* suspend the calling context */
     void  (*unpark)(void *handle); /* resume the context identified by handle */
+    /* Optional absolute CLOCK_MONOTONIC deadline wait. It returns DLSM_OK for
+     * a notification, or a sync timeout/cancel/error status. Queue ownership
+     * is still arbitrated by the synchronization primitive after wakeup. */
+    dlsm_status (*park_until)(uint64_t deadline_ns);
 } dlsm_suspend_ops;
 
-typedef struct {
+typedef struct dlsm_gt_mutex {
     const dlsm_suspend_ops *ops;
     dlsm_ticket_lock qlock;        /* guards the fields below; never held across park */
     int   locked;
+    int   initialized;
+    void *owner;
     void *head, *tail;             /* FIFO of internal waiter nodes */
 } dlsm_gt_mutex;
 
-void dlsm_gt_mutex_init(dlsm_gt_mutex *m, const dlsm_suspend_ops *ops);
-void dlsm_gt_mutex_lock(dlsm_gt_mutex *m);
-void dlsm_gt_mutex_unlock(dlsm_gt_mutex *m);
+dlsm_status dlsm_gt_mutex_init(dlsm_gt_mutex *m,
+                               const dlsm_suspend_ops *ops);
+dlsm_status dlsm_gt_mutex_lock(dlsm_gt_mutex *m);
+dlsm_status dlsm_gt_mutex_timedlock(dlsm_gt_mutex *m,
+                                    uint64_t deadline_ns);
+dlsm_status dlsm_gt_mutex_trylock(dlsm_gt_mutex *m, int *acquired);
+dlsm_status dlsm_gt_mutex_unlock(dlsm_gt_mutex *m);
+dlsm_status dlsm_gt_mutex_destroy(dlsm_gt_mutex *m);
+
+typedef struct dlsm_gt_condition {
+    const dlsm_suspend_ops *ops;
+    dlsm_ticket_lock qlock;
+    int initialized;
+    void *head, *tail;
+} dlsm_gt_condition;
+
+dlsm_status dlsm_gt_condition_init(dlsm_gt_condition *condition,
+                                    const dlsm_suspend_ops *ops);
+dlsm_status dlsm_gt_condition_wait(dlsm_gt_condition *condition,
+                                    dlsm_gt_mutex *mutex);
+dlsm_status dlsm_gt_condition_timedwait(dlsm_gt_condition *condition,
+                                         dlsm_gt_mutex *mutex,
+                                         uint64_t deadline_ns);
+dlsm_status dlsm_gt_condition_signal(dlsm_gt_condition *condition);
+dlsm_status dlsm_gt_condition_broadcast(dlsm_gt_condition *condition);
+dlsm_status dlsm_gt_condition_destroy(dlsm_gt_condition *condition);
+
+/* Manual-reset event: set wakes all waiters and remains set until reset. */
+typedef struct dlsm_gt_event {
+    const dlsm_suspend_ops *ops;
+    dlsm_ticket_lock qlock;
+    int initialized;
+    int signalled;
+    void *head, *tail;
+} dlsm_gt_event;
+
+dlsm_status dlsm_gt_event_init(dlsm_gt_event *event,
+                                const dlsm_suspend_ops *ops,
+                                int initially_signalled);
+dlsm_status dlsm_gt_event_wait(dlsm_gt_event *event);
+dlsm_status dlsm_gt_event_set(dlsm_gt_event *event);
+dlsm_status dlsm_gt_event_reset(dlsm_gt_event *event);
+dlsm_status dlsm_gt_event_destroy(dlsm_gt_event *event);
+
+typedef struct dlsm_gt_semaphore {
+    const dlsm_suspend_ops *ops;
+    dlsm_ticket_lock qlock;
+    int initialized;
+    uint64_t count;
+    void *head, *tail;
+} dlsm_gt_semaphore;
+
+dlsm_status dlsm_gt_semaphore_init(dlsm_gt_semaphore *semaphore,
+                                    const dlsm_suspend_ops *ops,
+                                    uint64_t initial_count);
+dlsm_status dlsm_gt_semaphore_wait(dlsm_gt_semaphore *semaphore);
+dlsm_status dlsm_gt_semaphore_post(dlsm_gt_semaphore *semaphore);
+dlsm_status dlsm_gt_semaphore_destroy(dlsm_gt_semaphore *semaphore);
+
+/* Reusable counted completion barrier. Positive add calls start work, done is
+ * add(-1), and wait parks until the count reaches zero. A new generation may
+ * start only after every waiter from the previous generation has returned. */
+typedef struct dlsm_gt_wait_group {
+    const dlsm_suspend_ops *ops;
+    dlsm_ticket_lock qlock;
+    int initialized;
+    uint64_t count;
+    uint64_t waiters;
+    void *head, *tail;
+} dlsm_gt_wait_group;
+
+dlsm_status dlsm_gt_wait_group_init(dlsm_gt_wait_group *group,
+                                     const dlsm_suspend_ops *ops,
+                                     uint64_t initial_count);
+dlsm_status dlsm_gt_wait_group_add(dlsm_gt_wait_group *group, int64_t delta);
+dlsm_status dlsm_gt_wait_group_done(dlsm_gt_wait_group *group);
+dlsm_status dlsm_gt_wait_group_wait(dlsm_gt_wait_group *group);
+dlsm_status dlsm_gt_wait_group_destroy(dlsm_gt_wait_group *group);
+
+/* One-shot completion latch. complete wakes every current waiter; future
+ * waits return immediately. A completion cannot be reset or completed twice. */
+typedef struct dlsm_gt_completion {
+    const dlsm_suspend_ops *ops;
+    dlsm_ticket_lock qlock;
+    int initialized;
+    int completed;
+    void *head, *tail;
+} dlsm_gt_completion;
+
+dlsm_status dlsm_gt_completion_init(dlsm_gt_completion *completion,
+                                     const dlsm_suspend_ops *ops);
+dlsm_status dlsm_gt_completion_wait(dlsm_gt_completion *completion);
+dlsm_status dlsm_gt_completion_complete(dlsm_gt_completion *completion);
+dlsm_status dlsm_gt_completion_destroy(dlsm_gt_completion *completion);
 
 void        dlsm_ebr_init(dlsm_ebr *e);
 /* Register the calling thread and write its slot to `out_slot`. */
