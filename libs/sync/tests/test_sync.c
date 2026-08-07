@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/sync.h"
 #include <string.h>
 #include <stdlib.h>
@@ -165,7 +165,7 @@ static void test_gt_completion_is_one_shot(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_strerror_table);
     RUN_TEST(test_gt_mutex_uncontended);
     RUN_TEST(test_gt_mutex_trylock_and_state_checks);
@@ -176,5 +176,5 @@ int main(void) {
     RUN_TEST(test_ebr_register_full);
     RUN_TEST(test_ebr_frees_after_grace);
     RUN_TEST(test_ebr_no_premature_free);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

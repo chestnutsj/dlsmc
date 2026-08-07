@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
-project(dlsm VERSION 0.1.0 LANGUAGES C ASM)
+project(dlsm VERSION 0.1.0 LANGUAGES C CXX ASM)
 
 option(DLSM_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 option(DLSM_BUILD_IO "Build the io_uring library, tests, and examples" ON)
+option(DLSM_BUILD_GT_MYSQL_COMPAT "Build the GreatDB Linux SHM GT example" OFF)
+option(DLSM_BUILD_MYSQL_SHM_COMPAT "Build the GreatDB Linux SHM compatibility library" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -17,6 +19,9 @@ endif()
 
 add_compile_options(-Wall -Wextra -Werror)
 
+# Show FetchContent's download step when CPM needs to fetch a dependency.
+set(FETCHCONTENT_QUIET OFF)
+
 include(cmake/CPM.cmake)
 include(cmake/sanitizers.cmake)
 include(cmake/coverage.cmake)
@@ -26,10 +31,17 @@ include(CMakePackageConfigHelpers)
 find_package(Threads REQUIRED)
 
 CPMAddPackage(
-  NAME unity
-  GITHUB_REPOSITORY ThrowTheSwitch/Unity
-  VERSION 2.6.0
+  NAME googletest
+  GITHUB_REPOSITORY google/googletest
+  VERSION 1.16.0
+  OPTIONS
+    "INSTALL_GTEST OFF"
 )
+
+add_library(dlsm_gtest_runner STATIC cmake/dlsm_gtest_runner.cc)
+target_include_directories(dlsm_gtest_runner PUBLIC cmake)
+target_link_libraries(dlsm_gtest_runner PUBLIC GTest::gtest)
+target_compile_features(dlsm_gtest_runner PUBLIC cxx_std_17)
 
 if(DLSM_BUILD_BENCHMARKS)
   enable_language(CXX)
@@ -83,6 +95,7 @@ add_subdirectory(libs/core)
 add_subdirectory(libs/shm)
 add_subdirectory(libs/sync)
 add_subdirectory(libs/greenthread)
+add_subdirectory(libs/mysql_compat)
 
 # Public convenience target for embedders. This is intentionally INTERFACE:
 # it creates no third library and follows the static/shared choice of the two
@@ -93,7 +106,7 @@ set_target_properties(dlsm_gt PROPERTIES EXPORT_NAME gt)
 target_link_libraries(dlsm_gt INTERFACE dlsm_greenthread dlsm_sync)
 
 add_executable(test_gt_adapter libs/greenthread/tests/test_gt_adapter.c)
-target_link_libraries(test_gt_adapter PRIVATE dlsm_gt unity pthread)
+target_link_libraries(test_gt_adapter PRIVATE dlsm_gt dlsm_gtest_runner pthread)
 dlsm_apply_sanitizer(test_gt_adapter)
 dlsm_apply_coverage(test_gt_adapter)
 add_test(NAME test_gt_adapter
@@ -103,6 +116,9 @@ add_subdirectory(libs/index)
 if(DLSM_IO_URING_AVAILABLE)
   add_subdirectory(libs/io)
   add_subdirectory(examples)
+endif()
+if(DLSM_BUILD_GT_MYSQL_COMPAT)
+  add_subdirectory(examples/gt_mysql_compat)
 endif()
 
 # Check the complete embedding project at configure time. The fixture directory
@@ -153,14 +169,23 @@ set_tests_properties(cmake_gt_blocking_call_allowed PROPERTIES
   PASS_REGULAR_EXPRESSION "GT blocking-call source warning passed")
 
 install(TARGETS dlsm_core dlsm_sync dlsm_greenthread dlsm_gt
+                dlsm_mysql_tcp_wrap dlsm_mysql_tcp_compat
   EXPORT dlsmTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(TARGET dlsm_mysql_shm_compat)
+  install(TARGETS dlsm_mysql_shm_compat
+    EXPORT dlsmTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(DIRECTORY
   libs/core/include/dlsm
   libs/sync/include/dlsm
   libs/greenthread/include/dlsm
+  libs/mysql_compat/include/dlsm
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT dlsmTargets FILE dlsmTargets.cmake NAMESPACE dlsm::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/dlsm)

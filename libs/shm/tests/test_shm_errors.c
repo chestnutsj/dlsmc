@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/shm.h"
 #include <fcntl.h>
 #include <string.h>
@@ -58,10 +58,10 @@ static void test_fixed_base_collision_is_non_destructive(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_every_code_has_message);
     RUN_TEST(test_unknown_code);
     RUN_TEST(test_truncated_segment_is_rejected);
     RUN_TEST(test_fixed_base_collision_is_non_destructive);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

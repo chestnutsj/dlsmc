@@ -1,0 +1,156 @@
+diff --git a/include/violite.h b/include/violite.h
+index 4a25309..8b86d8f 100644
+--- a/include/violite.h
++++ b/include/violite.h
+@@ -181,6 +181,45 @@ enum enum_vio_linux_shm_wait_mode {
+   VIO_LINUX_SHM_WAIT_FUTEX = 1
+ };
+ 
++/**
++  Result returned by a process-local Linux SHM cooperative wait adapter.
++
++  A wakeup may be spurious. The VIO implementation always rechecks the ring,
++  connection state, epoch, and deadline after the adapter returns.
++*/
++enum enum_vio_linux_shm_adapter_wait_result {
++  VIO_LINUX_SHM_ADAPTER_WOKEN = 0,
++  VIO_LINUX_SHM_ADAPTER_TIMED_OUT = 1,
++  VIO_LINUX_SHM_ADAPTER_ERROR = 2
++};
++
++/**
++  Optional process-local adapter for cooperative Linux SHM waits.
++
++  `applies` must return true only when the calling execution context can use
++  `wait` (for example, while running on a green thread). `wait` suspends that
++  execution context while `*epoch == expected`. `deadline_ns` is an absolute
++  CLOCK_MONOTONIC deadline, or UINT64_MAX when no timeout was requested.
++
++  The object and context referenced by it must remain valid until the adapter
++  is cleared and all concurrent Linux SHM operations have completed. Install
++  or clear an adapter only while client connection activity is quiescent.
++*/
++struct Vio_linux_shm_wait_adapter {
++  bool (*applies)(void *context);
++  enum enum_vio_linux_shm_adapter_wait_result (*wait)(
++      void *context, const uint32_t *epoch, uint32_t expected,
++      uint64_t deadline_ns);
++  void *context;
++};
++
++/**
++  Install a process-local Linux SHM wait adapter, or pass nullptr to clear it.
++  Processes that do not install an adapter retain the original behavior.
++*/
++void vio_linux_shm_set_wait_adapter(
++    const Vio_linux_shm_wait_adapter *adapter);
++
+ /** Return the bytes required for one connection mapping, or zero on error. */
+ size_t vio_linux_shm_mapping_size(uint32_t client_to_server_capacity,
+                                   uint32_t server_to_client_capacity);
+diff --git a/vio/vioshm_linux.cc b/vio/vioshm_linux.cc
+index a83aaba..d28e630 100644
+--- a/vio/vioshm_linux.cc
++++ b/vio/vioshm_linux.cc
+@@ -29,6 +29,7 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <limits>
+ #include <new>
+ 
+@@ -118,6 +119,9 @@ struct Linux_shm_context {
+   int last_error;
+ };
+ 
++std::atomic<const Vio_linux_shm_wait_adapter *> linux_shm_wait_adapter{
++    nullptr};
++
+ enum class Wait_result { ready, closed, timeout, error };
+ enum class Wait_condition { data_available, space_available };
+ 
+@@ -225,6 +229,16 @@ bool deadline_expired(const struct timespec *deadline) {
+          (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec);
+ }
+ 
++uint64_t deadline_ns(const struct timespec *deadline) {
++  if (deadline == nullptr) return UINT64_MAX;
++  const uint64_t seconds = static_cast<uint64_t>(deadline->tv_sec);
++  if (seconds > (UINT64_MAX - static_cast<uint64_t>(deadline->tv_nsec)) /
++                    UINT64_C(1000000000))
++    return UINT64_MAX - 1;
++  return seconds * UINT64_C(1000000000) +
++         static_cast<uint64_t>(deadline->tv_nsec);
++}
++
+ int futex_wait(uint32_t *address, uint32_t expected,
+                const struct timespec *deadline) {
+   if (deadline == nullptr)
+@@ -294,6 +308,12 @@ Wait_result wait_for_condition(Linux_shm_context *ctx,
+                          ? &ring.shared->data_waiter
+                          : &ring.shared->space_waiter;
+ 
++  const Vio_linux_shm_wait_adapter *adapter =
++      linux_shm_wait_adapter.load(std::memory_order_acquire);
++  const bool use_adapter = adapter != nullptr && adapter->applies != nullptr &&
++                           adapter->wait != nullptr &&
++                           adapter->applies(adapter->context);
++
+   uint64_t iteration = 0;
+   for (;;) {
+     bool corrupt = false;
+@@ -304,8 +324,8 @@ Wait_result wait_for_condition(Linux_shm_context *ctx,
+       return Wait_result::closed;
+     if (deadline_expired(deadline)) return Wait_result::timeout;
+ 
+-    if (iteration < ctx->spin_count ||
+-        ctx->wait_mode == VIO_LINUX_SHM_WAIT_POLLING) {
++    if (iteration < ctx->spin_count ||
++        (!use_adapter && ctx->wait_mode == VIO_LINUX_SHM_WAIT_POLLING)) {
+       cpu_relax(static_cast<uint32_t>(iteration));
+       ++iteration;
+       continue;
+@@ -326,11 +346,27 @@ Wait_result wait_for_condition(Linux_shm_context *ctx,
+       continue;
+     }
+ 
+-    const int result = futex_wait(epoch, expected, deadline);
+-    const int wait_error = errno;
++    if (use_adapter) {
++      const enum_vio_linux_shm_adapter_wait_result result = adapter->wait(
++          adapter->context, epoch, expected, deadline_ns(deadline));
++      atomic_store(waiter, uint32_t{0}, __ATOMIC_RELEASE);
++      switch (result) {
++        case VIO_LINUX_SHM_ADAPTER_WOKEN:
++          continue;
++        case VIO_LINUX_SHM_ADAPTER_TIMED_OUT:
++          return Wait_result::timeout;
++        case VIO_LINUX_SHM_ADAPTER_ERROR:
++          return Wait_result::error;
++      }
++      return Wait_result::error;
++    }
++
++    const int futex_result = futex_wait(epoch, expected, deadline);
++    const int wait_error = errno;
+     atomic_store(waiter, uint32_t{0}, __ATOMIC_RELEASE);
+ 
+-    if (result == 0 || wait_error == EAGAIN || wait_error == EINTR) continue;
++    if (futex_result == 0 || wait_error == EAGAIN || wait_error == EINTR)
++      continue;
+     if (wait_error == ETIMEDOUT) return Wait_result::timeout;
+     return Wait_result::error;
+   }
+@@ -416,6 +452,11 @@ size_t vio_linux_shm_mapping_size(uint32_t client_to_server_capacity,
+              ? total_size
+              : 0;
+ }
++
++void vio_linux_shm_set_wait_adapter(
++    const Vio_linux_shm_wait_adapter *adapter) {
++  linux_shm_wait_adapter.store(adapter, std::memory_order_release);
++}
+ 
+ int vio_linux_shm_initialize(void *mapping, size_t mapping_size,
+                              uint32_t client_to_server_capacity,

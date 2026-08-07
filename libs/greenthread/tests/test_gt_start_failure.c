@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/greenthread.h"
 
 void setUp(void) {}
@@ -37,10 +37,10 @@ static void test_partial_vp_create_failure_joins_started_vp(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_timer_thread_create_failure_rolls_back);
     RUN_TEST(test_blocking_thread_create_failure_rolls_back);
     RUN_TEST(test_first_vp_create_failure_rolls_back_services);
     RUN_TEST(test_partial_vp_create_failure_joins_started_vp);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

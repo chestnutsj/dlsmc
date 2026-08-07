@@ -19,7 +19,7 @@ dlsm_apply_coverage(dlsm_greenthread)
 
 # --- unit tests ---
 add_executable(test_gt tests/test_gt.c)
-target_link_libraries(test_gt PRIVATE dlsm_greenthread unity pthread)
+target_link_libraries(test_gt PRIVATE dlsm_greenthread dlsm_gtest_runner pthread)
 dlsm_apply_sanitizer(test_gt)
 dlsm_apply_coverage(test_gt)
 add_test(NAME test_gt COMMAND ${DLSM_TEST_LAUNCHER} $<TARGET_FILE:test_gt>)
@@ -36,7 +36,7 @@ target_compile_definitions(test_gt_start_failure PRIVATE
 target_include_directories(test_gt_start_failure PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_gt_start_failure PRIVATE
-  dlsm_core dlsm_sync unity Threads::Threads)
+  dlsm_core dlsm_sync dlsm_gtest_runner Threads::Threads)
 dlsm_apply_sanitizer(test_gt_start_failure)
 dlsm_apply_coverage(test_gt_start_failure)
 add_test(NAME test_gt_start_failure

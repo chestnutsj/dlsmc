@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/shm.h"
 #include <stdint.h>
 #include <sys/mman.h>
@@ -27,7 +27,7 @@ static void test_create_reports_geometry(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_create_reports_geometry);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

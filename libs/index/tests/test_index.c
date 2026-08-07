@@ -1,6 +1,6 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/index.h"
-
+#include <stdio.h>
 #include <string.h>
 
 void setUp(void) {}
@@ -156,12 +156,12 @@ static void test_oracle_random(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_strerror);
     RUN_TEST(test_insert_get);
     RUN_TEST(test_get_absent);
     RUN_TEST(test_consolidate);
     RUN_TEST(test_split_growth);
     RUN_TEST(test_oracle_random);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

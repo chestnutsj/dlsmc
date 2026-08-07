@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/shm.h"
 #include "test_util.h"
 #include <stdint.h>
@@ -83,7 +83,7 @@ static void test_alloc_exhaust_then_null(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_alloc_in_region_and_aligned);
     RUN_TEST(test_alloc_monotonic_no_overlap);
     RUN_TEST(test_property_random_allocs);
@@ -93,5 +93,5 @@ int main(void) {
     RUN_TEST(test_alloc_size_overflow_returns_null);
     RUN_TEST(test_offset_round_trip);
     RUN_TEST(test_alloc_exhaust_then_null);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

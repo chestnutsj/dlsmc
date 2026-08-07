@@ -54,7 +54,12 @@ static void  gt_park_counted(void) {
     dlsm_gt_park();
 }
 static void  gt_unpark_one(void *h) { dlsm_gt_unpark((dlsm_gt_task *)h); }
-static const dlsm_suspend_ops GT_OPS = { gt_current, gt_park_counted, gt_unpark_one };
+static const dlsm_suspend_ops GT_OPS = {
+    .current = gt_current,
+    .park = gt_park_counted,
+    .unpark = gt_unpark_one,
+    .park_until = NULL,
+};
 
 typedef struct {
     dlsm_io       *io;

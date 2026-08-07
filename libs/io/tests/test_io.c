@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/io.h"
 #include "dlsm/greenthread.h"
 
@@ -182,7 +182,7 @@ static void test_socket_recv_send(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_strerror);
     RUN_TEST(test_outside_green_thread);
     RUN_TEST(test_roundtrip);
@@ -190,5 +190,5 @@ int main(void) {
     RUN_TEST(test_concurrent_io);
     RUN_TEST(test_property_roundtrip);
     RUN_TEST(test_socket_recv_send);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

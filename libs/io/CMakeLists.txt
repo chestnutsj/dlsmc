@@ -6,7 +6,7 @@ dlsm_apply_sanitizer(dlsm_io)
 dlsm_apply_coverage(dlsm_io)
 
 add_executable(test_io tests/test_io.c)
-target_link_libraries(test_io PRIVATE dlsm_io unity pthread)
+target_link_libraries(test_io PRIVATE dlsm_io dlsm_gtest_runner pthread)
 dlsm_apply_sanitizer(test_io)
 dlsm_apply_coverage(test_io)
 add_test(NAME test_io COMMAND ${DLSM_TEST_LAUNCHER} $<TARGET_FILE:test_io>)

@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 
 /* A host can replace one mapping without copying or editing the adapter. */
 #define DLSM_GT_ADAPTER_NOW() UINT64_C(123)
@@ -97,7 +97,7 @@ static void test_adapter_maps_public_host_operations(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_adapter_maps_public_host_operations);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

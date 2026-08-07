@@ -16,9 +16,25 @@ endif()
 # Expand relative path. This is important if the provided path contains a tilde (~)
 get_filename_component(CPM_DOWNLOAD_LOCATION ${CPM_DOWNLOAD_LOCATION} ABSOLUTE)
 
-file(DOWNLOAD
-     https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake
-     ${CPM_DOWNLOAD_LOCATION} EXPECTED_HASH SHA256=${CPM_HASH_SUM}
-)
+set(CPM_DOWNLOAD_URL
+    "https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake")
+
+set(CPM_DOWNLOAD_REQUIRED TRUE)
+if(EXISTS "${CPM_DOWNLOAD_LOCATION}")
+  file(SHA256 "${CPM_DOWNLOAD_LOCATION}" CPM_EXISTING_HASH_SUM)
+  if(CPM_EXISTING_HASH_SUM STREQUAL CPM_HASH_SUM)
+    set(CPM_DOWNLOAD_REQUIRED FALSE)
+  endif()
+endif()
+
+if(CPM_DOWNLOAD_REQUIRED)
+  message(STATUS
+    "Downloading dependency CPM.cmake ${CPM_DOWNLOAD_VERSION} from ${CPM_DOWNLOAD_URL}")
+  file(DOWNLOAD
+       "${CPM_DOWNLOAD_URL}"
+       "${CPM_DOWNLOAD_LOCATION}"
+       EXPECTED_HASH SHA256=${CPM_HASH_SUM}
+       SHOW_PROGRESS)
+endif()
 
 include(${CPM_DOWNLOAD_LOCATION})

@@ -49,8 +49,15 @@ static void  gt_park_counted(void) {
     atomic_fetch_add_explicit(&g_contended, 1, memory_order_relaxed);
     dlsm_gt_park();
 }
-static void  gt_unpark_one(void *h) { dlsm_gt_unpark((dlsm_gt_task *)h); }
-static const dlsm_suspend_ops GT_OPS = { gt_current, gt_park_counted, gt_unpark_one };
+static void  gt_unpark_one(void *h) { 
+	dlsm_gt_unpark((dlsm_gt_task *)h);
+}
+const dlsm_suspend_ops GT_OPS = {
+    .current = gt_current,
+    .park = gt_park_counted,
+    .unpark = gt_unpark_one,
+    .park_until = NULL,
+};
 
 /* ---------------------------------------------------------------------------
  * Shared "database": one file, one 8-byte record at offset 0.

@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/greenthread.h"
 #include "dlsm/sync.h"
 #include <errno.h>
@@ -2067,7 +2067,7 @@ static void test_blocking_pool_can_be_explicitly_disabled(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_strerror);
     RUN_TEST(test_spawn_runs);
     RUN_TEST(test_locals_preserved_across_yield);
@@ -2128,5 +2128,5 @@ int main(void) {
     RUN_TEST(test_gt_completion_wakes_all_and_stays_complete);
     RUN_TEST(test_blocking_pool_parks_gt_and_preserves_errno);
     RUN_TEST(test_blocking_pool_can_be_explicitly_disabled);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

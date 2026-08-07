@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/shm.h"
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -124,12 +124,12 @@ static void test_concurrent_recovery_has_one_writer(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_in_use_is_refused);
     RUN_TEST(test_stale_segment_recovers);
     RUN_TEST(test_cleanup_if_stale_dead_owner);
     RUN_TEST(test_cleanup_if_stale_live_owner_keeps);
     RUN_TEST(test_cleanup_if_stale_absent_is_ok);
     RUN_TEST(test_concurrent_recovery_has_one_writer);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

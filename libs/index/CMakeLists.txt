@@ -6,7 +6,7 @@ dlsm_apply_sanitizer(dlsm_index)
 dlsm_apply_coverage(dlsm_index)
 
 add_executable(test_index tests/test_index.c)
-target_link_libraries(test_index PRIVATE dlsm_index unity)
+target_link_libraries(test_index PRIVATE dlsm_index dlsm_gtest_runner)
 dlsm_apply_sanitizer(test_index)
 dlsm_apply_coverage(test_index)
 add_test(NAME test_index COMMAND ${DLSM_TEST_LAUNCHER} $<TARGET_FILE:test_index>)

@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/shm.h"
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -57,8 +57,8 @@ static void test_observer_alloc_returns_null(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_observer_reads_same_base_and_data);
     RUN_TEST(test_observer_alloc_returns_null);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }

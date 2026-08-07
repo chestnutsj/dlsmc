@@ -1,4 +1,4 @@
-#include "unity.h"
+#include "dlsm_gtest.h"
 #include "dlsm/core.h"
 #include <string.h>
 
@@ -14,8 +14,8 @@ static void test_unknown_message(void) {
 }
 
 int main(void) {
-    UNITY_BEGIN();
+    DLSM_GTEST_BEGIN();
     RUN_TEST(test_ok_message);
     RUN_TEST(test_unknown_message);
-    return UNITY_END();
+    return DLSM_GTEST_END();
 }
